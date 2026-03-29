@@ -7,6 +7,7 @@ Schema is auto-created on first connection. Migrations via schema_version table.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from pathlib import Path
 
@@ -19,7 +20,9 @@ from handwriting_engine.benchmark.models import (
 )
 
 DEFAULT_DB_PATH = Path.home() / ".handwriting-engine" / "benchmark.db"
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 3
+
+logger = logging.getLogger(__name__)
 
 _SCHEMA_SQL = """\
 CREATE TABLE IF NOT EXISTS samples (
@@ -106,6 +109,47 @@ CREATE TABLE IF NOT EXISTS schema_version (
 """
 
 
+# Schema migrations — keyed by version number, SQL to upgrade FROM previous version
+_MIGRATIONS: dict[int, str] = {
+    # v1 is the base schema (already created by _SCHEMA_SQL)
+    # v2: Add enhancement_strategy and cache_hit columns to provider_outputs
+    2: """
+        ALTER TABLE provider_outputs ADD COLUMN enhancement_strategy TEXT DEFAULT NULL;
+        ALTER TABLE provider_outputs ADD COLUMN cache_hit INTEGER DEFAULT 0;
+        UPDATE schema_version SET version = 2;
+    """,
+    # v3: Add cost_usd column to runs
+    3: """
+        ALTER TABLE runs ADD COLUMN total_cost_usd REAL DEFAULT 0.0;
+        UPDATE schema_version SET version = 3;
+    """,
+}
+
+
+def _apply_migrations(conn):
+    """Apply any pending schema migrations."""
+    try:
+        row = conn.execute("SELECT version FROM schema_version").fetchone()
+        current = row[0] if row else 1
+    except Exception:
+        current = 1
+
+    for version in sorted(_MIGRATIONS.keys()):
+        if version > current:
+            logger.info(f"Applying schema migration v{current} -> v{version}")
+            try:
+                conn.executescript(_MIGRATIONS[version])
+                logger.info(f"Migration to v{version} complete")
+            except Exception as e:
+                logger.warning(f"Migration to v{version} failed (may already be applied): {e}")
+                # Try to update version anyway if columns already exist
+                try:
+                    conn.execute(f"UPDATE schema_version SET version = {version}")
+                    conn.commit()
+                except Exception:
+                    pass
+
+
 def get_connection(db_path: Path | str | None = None) -> sqlite3.Connection:
     """Open the benchmark database, creating schema if needed.
 
@@ -138,6 +182,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             (CURRENT_SCHEMA_VERSION,),
         )
         conn.commit()
+    _apply_migrations(conn)
 
 
 # --- Samples ---

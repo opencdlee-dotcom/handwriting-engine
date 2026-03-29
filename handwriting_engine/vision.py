@@ -27,6 +27,7 @@ def read_page(
     inject_strategies: bool = True,
     auto_enhance: bool = False,
     inject_lessons: bool = True,
+    writer_id: str | None = None,
 ) -> str:
     """
     Read a single handwritten page.
@@ -91,6 +92,13 @@ def read_page(
         if lessons:
             system_prompt = system_prompt + "\n\n" + lessons if system_prompt else lessons
 
+    # Inject writer-specific calibration if available
+    if writer_id:
+        from handwriting_engine.lessons import load_writer_calibration
+        writer_cal = load_writer_calibration(writer_id)
+        if writer_cal:
+            system_prompt = (system_prompt + "\n\n" + writer_cal) if system_prompt else writer_cal
+
     p = get_provider(provider)
     return p.read_image(b64_data, media_type, prompt, system_prompt, max_tokens)
 
@@ -136,6 +144,7 @@ def read_with_consensus(
     content_type: str = "default",
     inject_strategies: bool = True,
     inject_lessons: bool = True,
+    writer_id: str | None = None,
 ) -> ConsensusResult:
     """
     Read a page using multi-model consensus.
@@ -170,6 +179,13 @@ def read_with_consensus(
         lessons = build_lessons_prompt(category=domain)
         if lessons:
             system_prompt = system_prompt + "\n\n" + lessons if system_prompt else lessons
+
+    # Inject writer-specific calibration if available
+    if writer_id:
+        from handwriting_engine.lessons import load_writer_calibration
+        writer_cal = load_writer_calibration(writer_id)
+        if writer_cal:
+            system_prompt = (system_prompt + "\n\n" + writer_cal) if system_prompt else writer_cal
 
     return _consensus(
         image_b64=b64_data,

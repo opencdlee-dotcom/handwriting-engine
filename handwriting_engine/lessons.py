@@ -186,3 +186,46 @@ def clear_lessons(
     path = _lessons_file(category, lessons_dir)
     if path.exists():
         path.unlink()
+
+
+def save_writer_calibration(
+    writer_id: str,
+    calibration_notes: str,
+    lessons_dir: Path | str | None = None,
+) -> None:
+    """Save writer-specific calibration notes.
+
+    Writer calibration notes describe a specific person's handwriting style
+    (e.g., "crosses 7s, open-top 4s, angular B that looks like D").
+    These are loaded before reading that writer's submissions.
+
+    Args:
+        writer_id: Identifier for the writer (e.g., "student_alice", "lab_section_3a").
+        calibration_notes: Description of the writer's handwriting characteristics.
+        lessons_dir: Override the default storage directory.
+    """
+    category = f"writer_{writer_id}"
+    save_lesson(calibration_notes, category=category, lessons_dir=lessons_dir)
+
+
+def load_writer_calibration(
+    writer_id: str,
+    lessons_dir: Path | str | None = None,
+) -> str:
+    """Load writer-specific calibration as a prompt section.
+
+    Returns a formatted prompt block for injection into vision calls,
+    or empty string if no calibration exists for this writer.
+    """
+    category = f"writer_{writer_id}"
+    lessons = load_lessons(category=category, limit=10, lessons_dir=lessons_dir)
+    if not lessons:
+        return ""
+
+    lines = [f"=== WRITER CALIBRATION FOR '{writer_id}' ==="]
+    lines.append("This writer's known handwriting characteristics:\n")
+    for i, note in enumerate(lessons, 1):
+        lines.append(f"{i}. {note}")
+    lines.append("\nApply these observations consistently across all text.")
+    lines.append("")
+    return "\n".join(lines)

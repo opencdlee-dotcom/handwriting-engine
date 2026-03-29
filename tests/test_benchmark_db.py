@@ -45,7 +45,8 @@ class TestSchemaCreation:
 
     def test_schema_version(self, db):
         row = db.execute("SELECT version FROM schema_version").fetchone()
-        assert row["version"] == 1
+        from handwriting_engine.benchmark.db import CURRENT_SCHEMA_VERSION
+        assert row["version"] == CURRENT_SCHEMA_VERSION
 
     def test_idempotent(self, db):
         # Calling ensure_schema again should not fail
