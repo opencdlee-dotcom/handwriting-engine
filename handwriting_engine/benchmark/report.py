@@ -1,0 +1,507 @@
+"""
+Benchmark reporting — comparison tables, regression detection, per-sample drill-down,
+quality correlation, and output formatting.
+"""
+
+from __future__ import annotations
+
+import csv
+import io
+import statistics
+from pathlib import Path
+
+from handwriting_engine.benchmark.db import (
+    get_connection,
+    get_latest_run_id,
+    get_run_results,
+    list_runs,
+)
+from handwriting_engine.benchmark.evaluate import estimate_cost
+from handwriting_engine.benchmark.models import StrategyResult
+
+
+def _aggregate_results(rows: list[dict]) -> list[StrategyResult]:
+    """Group run results by (provider, strategy) and compute aggregate metrics."""
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for row in rows:
+        key = (row["provider"], row["strategy"])
+        groups.setdefault(key, []).append(row)
+
+    results = []
+    for (provider, strategy), group_rows in sorted(groups.items()):
+        cers = [r["cer"] for r in group_rows if r.get("cer") is not None]
+        wers = [r["wer"] for r in group_rows if r.get("wer") is not None]
+        failures = sum(1 for r in group_rows if r.get("error"))
+        total_in = sum(r.get("input_tokens", 0) or 0 for r in group_rows)
+        total_out = sum(r.get("output_tokens", 0) or 0 for r in group_rows)
+
+        cost = estimate_cost(total_in, total_out, provider)
+
+        results.append(StrategyResult(
+            provider=provider,
+            strategy=strategy,
+            mean_cer=statistics.mean(cers) if cers else -1,
+            mean_wer=statistics.mean(wers) if wers else -1,
+            median_cer=statistics.median(cers) if cers else -1,
+            median_wer=statistics.median(wers) if wers else -1,
+            stdev_cer=statistics.stdev(cers) if len(cers) >= 2 else 0.0,
+            stdev_wer=statistics.stdev(wers) if len(wers) >= 2 else 0.0,
+            total_tokens=total_in + total_out,
+            estimated_cost_usd=cost,
+            sample_count=len(group_rows),
+            failures=failures,
+        ))
+
+    return results
+
+
+def generate_report(
+    run_id: int | None = None,
+    db_path: Path | str | None = None,
+    fmt: str = "table",
+) -> str:
+    """Generate a human-readable report for a benchmark run.
+
+    Args:
+        run_id: Specific run ID. Default: latest run.
+        db_path: Override database path.
+        fmt: Output format — 'table', 'json', or 'csv'.
+
+    Returns:
+        Formatted report string.
+    """
+    conn = get_connection(db_path)
+    try:
+        if run_id is None:
+            run_id = get_latest_run_id(conn)
+            if run_id is None:
+                return "No benchmark runs found. Run 'handwriting-engine benchmark run' first."
+
+        rows = get_run_results(conn, run_id)
+    finally:
+        conn.close()
+
+    if not rows:
+        return f"No results found for run {run_id}."
+
+    results = _aggregate_results(rows)
+
+    if fmt == "json":
+        return _format_json(run_id, results)
+    elif fmt == "csv":
+        return _format_csv(results)
+    return _format_table(run_id, results)
+
+
+def _format_table(run_id: int, results: list[StrategyResult]) -> str:
+    """Render results as an ASCII table."""
+    lines = [f"Benchmark Run #{run_id}", ""]
+
+    header = f"{'Provider':<20} {'Strategy':<10} {'CER':>8} {'±sd':>6} {'WER':>8} {'Tokens':>10} {'Cost':>8} {'N':>4} {'Fail':>4}"
+    lines.append(header)
+    lines.append("-" * len(header))
+
+    for r in sorted(results, key=lambda x: x.mean_cer if x.mean_cer >= 0 else 999):
+        cer_str = f"{r.mean_cer:.2%}" if r.mean_cer >= 0 else "N/A"
+        sd_str = f"{r.stdev_cer:.2%}" if r.stdev_cer > 0 else "---"
+        wer_str = f"{r.mean_wer:.2%}" if r.mean_wer >= 0 else "N/A"
+        cost_str = f"${r.estimated_cost_usd:.4f}"
+        lines.append(
+            f"{r.provider:<20} {r.strategy:<10} {cer_str:>8} {sd_str:>6} {wer_str:>8} "
+            f"{r.total_tokens:>10,} {cost_str:>8} {r.sample_count:>4} {r.failures:>4}"
+        )
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _format_json(run_id: int, results: list[StrategyResult]) -> str:
+    """Render results as JSON."""
+    import json
+    data = {
+        "run_id": run_id,
+        "results": [
+            {
+                "provider": r.provider,
+                "strategy": r.strategy,
+                "mean_cer": round(r.mean_cer, 6) if r.mean_cer >= 0 else None,
+                "mean_wer": round(r.mean_wer, 6) if r.mean_wer >= 0 else None,
+                "median_cer": round(r.median_cer, 6) if r.median_cer >= 0 else None,
+                "median_wer": round(r.median_wer, 6) if r.median_wer >= 0 else None,
+                "total_tokens": r.total_tokens,
+                "estimated_cost_usd": round(r.estimated_cost_usd, 6),
+                "sample_count": r.sample_count,
+                "failures": r.failures,
+            }
+            for r in results
+        ],
+    }
+    return json.dumps(data, indent=2)
+
+
+def _format_csv(results: list[StrategyResult]) -> str:
+    """Render results as properly escaped CSV."""
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["provider", "strategy", "mean_cer", "mean_wer", "median_cer",
+                      "median_wer", "total_tokens", "cost_usd", "samples", "failures"])
+    for r in results:
+        writer.writerow([
+            r.provider,
+            r.strategy,
+            f"{r.mean_cer:.6f}" if r.mean_cer >= 0 else "",
+            f"{r.mean_wer:.6f}" if r.mean_wer >= 0 else "",
+            f"{r.median_cer:.6f}" if r.median_cer >= 0 else "",
+            f"{r.median_wer:.6f}" if r.median_wer >= 0 else "",
+            r.total_tokens,
+            f"{r.estimated_cost_usd:.6f}",
+            r.sample_count,
+            r.failures,
+        ])
+    return output.getvalue().strip()
+
+
+def compare_runs(
+    run_id_1: int,
+    run_id_2: int,
+    db_path: Path | str | None = None,
+) -> str:
+    """Compare two benchmark runs side by side."""
+    conn = get_connection(db_path)
+    try:
+        rows_1 = get_run_results(conn, run_id_1)
+        rows_2 = get_run_results(conn, run_id_2)
+    finally:
+        conn.close()
+
+    if not rows_1:
+        return f"No results found for run {run_id_1}."
+    if not rows_2:
+        return f"No results found for run {run_id_2}."
+
+    results_1 = {(r.provider, r.strategy): r for r in _aggregate_results(rows_1)}
+    results_2 = {(r.provider, r.strategy): r for r in _aggregate_results(rows_2)}
+
+    all_keys = sorted(set(results_1) | set(results_2))
+
+    lines = [f"Comparison: Run #{run_id_1} vs Run #{run_id_2}", ""]
+    header = f"{'Provider':<20} {'Strategy':<10} {'CER #1':>8} {'CER #2':>8} {'Delta':>8} {'Status':>12}"
+    lines.append(header)
+    lines.append("-" * len(header))
+
+    regressions = 0
+    improvements = 0
+
+    for key in all_keys:
+        r1 = results_1.get(key)
+        r2 = results_2.get(key)
+        provider, strategy = key
+
+        if r1 and r2 and r1.mean_cer >= 0 and r2.mean_cer >= 0:
+            delta = r2.mean_cer - r1.mean_cer
+            if delta > 0.005:
+                status = "REGRESSION"
+                regressions += 1
+            elif delta < -0.005:
+                status = "IMPROVED"
+                improvements += 1
+            else:
+                status = "unchanged"
+            lines.append(
+                f"{provider:<20} {strategy:<10} {r1.mean_cer:>7.2%} {r2.mean_cer:>7.2%} "
+                f"{delta:>+7.2%} {status:>12}"
+            )
+        elif r1 and not r2:
+            cer_str = f"{r1.mean_cer:>7.2%}" if r1.mean_cer >= 0 else "    N/A"
+            lines.append(f"{provider:<20} {strategy:<10} {cer_str} {'---':>8} {'---':>8} {'removed':>12}")
+        elif r2 and not r1:
+            cer_str = f"{r2.mean_cer:>7.2%}" if r2.mean_cer >= 0 else "    N/A"
+            lines.append(f"{provider:<20} {strategy:<10} {'---':>8} {cer_str} {'---':>8} {'new':>12}")
+
+    lines.append("")
+    lines.append(f"Summary: {improvements} improved, {regressions} regressed, {len(all_keys) - improvements - regressions} unchanged")
+    return "\n".join(lines)
+
+
+def detect_regressions(
+    run_id: int | None = None,
+    threshold: float = 0.03,
+    db_path: Path | str | None = None,
+) -> list[dict]:
+    """Compare latest run against previous run. Returns list of regressions.
+
+    Default threshold is 3% — with small sample sizes (<30), differences
+    below this are within the noise floor and not meaningful.
+    """
+    conn = get_connection(db_path)
+    try:
+        runs = list_runs(conn)
+
+        if len(runs) < 2:
+            return []
+
+        if run_id is None:
+            current = runs[0]
+            previous = runs[1]
+        else:
+            current = next((r for r in runs if r.run_id == run_id), None)
+            idx = next((i for i, r in enumerate(runs) if r.run_id == run_id), None)
+            previous = runs[idx + 1] if idx is not None and idx + 1 < len(runs) else None
+
+        if not current or not previous:
+            return []
+
+        rows_curr = get_run_results(conn, current.run_id)
+        rows_prev = get_run_results(conn, previous.run_id)
+    finally:
+        conn.close()
+
+    agg_curr = {(r.provider, r.strategy): r for r in _aggregate_results(rows_curr)}
+    agg_prev = {(r.provider, r.strategy): r for r in _aggregate_results(rows_prev)}
+
+    regressions = []
+    for key, curr in agg_curr.items():
+        prev = agg_prev.get(key)
+        if prev and curr.mean_cer >= 0 and prev.mean_cer >= 0:
+            delta = curr.mean_cer - prev.mean_cer
+            if delta > threshold:
+                regressions.append({
+                    "provider": curr.provider,
+                    "strategy": curr.strategy,
+                    "previous_cer": prev.mean_cer,
+                    "current_cer": curr.mean_cer,
+                    "delta": delta,
+                })
+
+    return regressions
+
+
+def sample_drill_down(
+    sample_id: int,
+    run_id: int | None = None,
+    db_path: Path | str | None = None,
+) -> str:
+    """Generate a per-sample detail report showing all provider outputs and errors.
+
+    Args:
+        sample_id: The sample to drill into.
+        run_id: Specific run. Default: latest.
+        db_path: Override database path.
+
+    Returns:
+        Formatted per-sample report.
+    """
+    from handwriting_engine.benchmark.db import get_sample_by_id, get_latest_ground_truth
+
+    conn = get_connection(db_path)
+    try:
+        if run_id is None:
+            run_id = get_latest_run_id(conn)
+        if run_id is None:
+            return "No benchmark runs found."
+
+        sample = get_sample_by_id(conn, sample_id)
+        if not sample:
+            return f"Sample {sample_id} not found."
+
+        gt = get_latest_ground_truth(conn, sample_id)
+        rows = conn.execute(
+            """SELECT po.*, em.cer, em.wer
+               FROM provider_outputs po
+               LEFT JOIN eval_metrics em ON em.provider_output_id = po.id
+               WHERE po.run_id = ? AND po.sample_id = ?
+               ORDER BY po.provider, po.strategy""",
+            (run_id, sample_id),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    import os
+    lines = [
+        f"Sample #{sample_id}: {os.path.basename(sample.image_path)}",
+        f"Student: {sample.student or 'unknown'} | Page: {sample.page_number}",
+    ]
+
+    if gt:
+        gt_preview = gt.text[:100] + "..." if len(gt.text) > 100 else gt.text
+        lines.append(f"Ground Truth: {gt_preview}")
+    else:
+        lines.append("Ground Truth: NONE")
+
+    lines.append("")
+
+    if not rows:
+        lines.append("No provider outputs for this run.")
+        return "\n".join(lines)
+
+    for row in rows:
+        row = dict(row)
+        cer_str = f"{row['cer']:.2%}" if row.get("cer") is not None else "N/A"
+        wer_str = f"{row['wer']:.2%}" if row.get("wer") is not None else "N/A"
+
+        lines.append(f"  {row['provider']}/{row['strategy']} — CER: {cer_str}, WER: {wer_str}, "
+                     f"{row['latency_ms']}ms, {row.get('input_tokens', 0)}+{row.get('output_tokens', 0)} tokens")
+
+        if row.get("error"):
+            lines.append(f"    ERROR: {row['error']}")
+        else:
+            preview = row["output_text"][:100] + "..." if len(row["output_text"]) > 100 else row["output_text"]
+            lines.append(f"    Output: {preview}")
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+def quality_correlation(
+    run_id: int | None = None,
+    db_path: Path | str | None = None,
+) -> str:
+    """Report correlation between image quality metrics and CER.
+
+    Joins quality_assessments with eval_metrics to show whether
+    blur/contrast/brightness predicts recognition accuracy.
+
+    Returns:
+        Formatted correlation report.
+    """
+    conn = get_connection(db_path)
+    try:
+        if run_id is None:
+            run_id = get_latest_run_id(conn)
+        if run_id is None:
+            return "No benchmark runs found."
+
+        rows = conn.execute(
+            """SELECT qa.blur_score, qa.contrast_score, qa.brightness_mean, qa.quality,
+                      AVG(em.cer) as avg_cer, AVG(em.wer) as avg_wer, COUNT(*) as n
+               FROM quality_assessments qa
+               JOIN provider_outputs po ON po.sample_id = qa.sample_id
+               JOIN eval_metrics em ON em.provider_output_id = po.id
+               WHERE po.run_id = ?
+               GROUP BY qa.sample_id
+               ORDER BY avg_cer DESC""",
+            (run_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        return "No quality/accuracy data available. Ensure samples were ingested with quality assessment."
+
+    lines = [f"Quality vs Accuracy (Run #{run_id})", ""]
+    header = f"{'Quality':<8} {'Blur':>8} {'Contrast':>8} {'Brightness':>10} {'Avg CER':>8} {'Avg WER':>8} {'N':>4}"
+    lines.append(header)
+    lines.append("-" * len(header))
+
+    for r in rows:
+        lines.append(
+            f"{r['quality'] or '?':<8} {r['blur_score'] or 0:>8.1f} {r['contrast_score'] or 0:>8.2f} "
+            f"{r['brightness_mean'] or 0:>10.1f} {r['avg_cer']:>7.2%} {r['avg_wer']:>7.2%} {r['n']:>4}"
+        )
+
+    # Summary by quality tier
+    tiers: dict[str, list[float]] = {}
+    for r in rows:
+        q = r["quality"] or "unknown"
+        tiers.setdefault(q, []).append(r["avg_cer"])
+
+    if len(tiers) > 1:
+        lines.append("")
+        lines.append("By quality tier:")
+        for q in ["good", "fair", "poor"]:
+            if q in tiers:
+                cers = tiers[q]
+                lines.append(f"  {q}: avg CER {statistics.mean(cers):.2%} ({len(cers)} samples)")
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+def confidence_calibration(
+    run_id: int | None = None,
+    db_path: Path | str | None = None,
+) -> str:
+    """Report how well confidence scores predict actual accuracy.
+
+    Computes correlation between reported confidence and actual CER.
+    Flags miscalibrated outputs (high confidence + high error).
+    """
+    conn = get_connection(db_path)
+    try:
+        if run_id is None:
+            run_id = get_latest_run_id(conn)
+        if run_id is None:
+            return "No benchmark runs found."
+
+        rows = conn.execute(
+            """SELECT po.provider, po.strategy, po.confidence, em.cer
+               FROM provider_outputs po
+               JOIN eval_metrics em ON em.provider_output_id = po.id
+               WHERE po.run_id = ? AND po.error IS NULL
+               ORDER BY po.confidence DESC""",
+            (run_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    if len(rows) < 3:
+        return "Not enough data for calibration (need at least 3 successful outputs)."
+
+    confidences = [r["confidence"] for r in rows]
+    cers = [r["cer"] for r in rows]
+
+    # Pearson correlation (confidence should negatively correlate with CER)
+    n = len(confidences)
+    mean_conf = sum(confidences) / n
+    mean_cer = sum(cers) / n
+    cov = sum((c - mean_conf) * (e - mean_cer) for c, e in zip(confidences, cers)) / n
+    std_conf = (sum((c - mean_conf) ** 2 for c in confidences) / n) ** 0.5
+    std_cer = (sum((e - mean_cer) ** 2 for e in cers) / n) ** 0.5
+
+    if std_conf > 0 and std_cer > 0:
+        correlation = cov / (std_conf * std_cer)
+    else:
+        correlation = 0.0
+
+    lines = [f"Confidence Calibration (Run #{run_id})", ""]
+    lines.append(f"Correlation (confidence vs CER): {correlation:+.3f}")
+    if correlation > -0.3:
+        lines.append("  WARNING: Weak correlation — confidence scores are poorly calibrated")
+    elif correlation < -0.7:
+        lines.append("  Good: Strong negative correlation — confidence is meaningful")
+    else:
+        lines.append("  Moderate: Confidence has some predictive value")
+
+    lines.append("")
+
+    # Bucket by confidence ranges
+    buckets = {"0.0-0.3": [], "0.3-0.5": [], "0.5-0.7": [], "0.7-0.9": [], "0.9-1.0": []}
+    for r in rows:
+        c = r["confidence"]
+        if c < 0.3:
+            buckets["0.0-0.3"].append(r["cer"])
+        elif c < 0.5:
+            buckets["0.3-0.5"].append(r["cer"])
+        elif c < 0.7:
+            buckets["0.5-0.7"].append(r["cer"])
+        elif c < 0.9:
+            buckets["0.7-0.9"].append(r["cer"])
+        else:
+            buckets["0.9-1.0"].append(r["cer"])
+
+    lines.append(f"{'Confidence':>12} {'Avg CER':>8} {'N':>4}")
+    lines.append("-" * 28)
+    for bucket, bucket_cers in buckets.items():
+        if bucket_cers:
+            avg = statistics.mean(bucket_cers)
+            lines.append(f"{bucket:>12} {avg:>7.2%} {len(bucket_cers):>4}")
+
+    miscalibrated = [r for r in rows if r["confidence"] > 0.7 and r["cer"] > 0.1]
+    if miscalibrated:
+        lines.append("")
+        lines.append(f"Miscalibrated outputs ({len(miscalibrated)} found — high confidence, high error):")
+        for r in miscalibrated[:5]:
+            lines.append(f"  {r['provider']}/{r['strategy']}: confidence={r['confidence']:.2f}, CER={r['cer']:.2%}")
+
+    lines.append("")
+    return "\n".join(lines)

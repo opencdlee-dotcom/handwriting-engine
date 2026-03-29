@@ -1,0 +1,366 @@
+"""
+Benchmark evaluation engine.
+
+Runs providers and consensus strategies against samples with ground truth,
+computes CER/WER, and stores everything in the database.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from pathlib import Path
+from typing import Callable
+
+from handwriting_engine.benchmark.db import (
+    finish_run,
+    get_connection,
+    get_latest_ground_truth,
+    insert_eval_metric,
+    insert_provider_output,
+    insert_run,
+    samples_with_ground_truth,
+)
+from handwriting_engine.benchmark.metrics import character_error_rate, word_error_rate
+
+logger = logging.getLogger(__name__)
+
+# Cost per 1M tokens (USD) — update as pricing changes
+COST_PER_1M_TOKENS = {
+    "claude": {"input": 3.00, "output": 15.00},
+    "gemini": {"input": 0.15, "output": 0.60},
+    "openai": {"input": 2.00, "output": 8.00},
+}
+
+
+def estimate_cost(input_tokens: int, output_tokens: int, provider: str) -> float:
+    """Estimate USD cost from token counts.
+
+    For consensus providers like 'gemini+claude', averages costs across all
+    providers in the combination.
+    """
+    providers = provider.split("+") if "+" in provider else [provider]
+    total = 0.0
+    for p in providers:
+        rates = COST_PER_1M_TOKENS.get(p, {"input": 0, "output": 0})
+        total += (input_tokens * rates["input"] + output_tokens * rates["output"]) / 1_000_000
+    return total / len(providers) if len(providers) > 1 else total
+
+
+def _available_providers() -> list[str]:
+    """Get list of providers with installed SDKs and API keys."""
+    try:
+        from handwriting_engine.providers import available_providers
+        return available_providers()
+    except ImportError:
+        return []
+
+
+def _read_single(
+    image_path: str, provider: str, domain: str,
+    auto_enhance: bool = False, inject_lessons: bool = False,
+) -> dict:
+    """Read a single image with one provider. Returns result dict."""
+    from handwriting_engine.vision import read_page
+
+    # Optionally enhance before reading (matches production pipeline)
+    actual_path = image_path
+    if auto_enhance:
+        try:
+            from handwriting_engine.enhance import enhance_image
+            actual_path = enhance_image(image_path, strategy="smart")
+        except Exception:
+            actual_path = image_path
+
+    # Snapshot token usage BEFORE call to compute delta (providers are singletons)
+    pre_input = pre_output = 0
+    try:
+        from handwriting_engine.providers import get_provider
+        p = get_provider(provider)
+        pre_usage = p.usage
+        pre_input = pre_usage.get("input_tokens", 0)
+        pre_output = pre_usage.get("output_tokens", 0)
+    except Exception:
+        pass
+
+    start = time.monotonic()
+    error = None
+    text = ""
+    confidence = 0.0
+
+    try:
+        text = read_page(
+            actual_path, domain=domain, provider=provider,
+            inject_lessons=inject_lessons,
+        )
+        penalty = text.count("[?]") * 0.05 + text.count("[illegible") * 0.1
+        confidence = max(0.0, min(0.95, 1.0 - penalty))
+    except Exception as e:
+        error = f"{type(e).__name__}: {e}"
+        logger.warning("Provider %s failed on %s: %s", provider, image_path, error)
+
+    latency_ms = int((time.monotonic() - start) * 1000)
+
+    # Compute token DELTA (not cumulative total)
+    input_tokens = output_tokens = 0
+    try:
+        from handwriting_engine.providers import get_provider
+        p = get_provider(provider)
+        post_usage = p.usage
+        input_tokens = max(0, post_usage.get("input_tokens", 0) - pre_input)
+        output_tokens = max(0, post_usage.get("output_tokens", 0) - pre_output)
+    except Exception:
+        pass
+
+    return {
+        "text": text,
+        "confidence": confidence,
+        "latency_ms": latency_ms,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "error": error,
+    }
+
+
+def _read_consensus(
+    image_path: str, providers: list[str], strategy: str, domain: str
+) -> dict:
+    """Read with a consensus strategy. Returns result dict."""
+    from handwriting_engine.vision import read_with_consensus
+
+    start = time.monotonic()
+    error = None
+    text = ""
+    confidence = 0.0
+    input_tokens = output_tokens = 0
+
+    try:
+        result = read_with_consensus(
+            image_path,
+            domain=domain,
+            providers=providers,
+            strategy=strategy,
+        )
+        text = result.text
+        confidence = result.confidence
+        input_tokens = result.tokens_used.get("input_tokens", 0)
+        output_tokens = result.tokens_used.get("output_tokens", 0)
+    except Exception as e:
+        error = f"{type(e).__name__}: {e}"
+        logger.warning("Consensus %s failed on %s: %s", strategy, image_path, error)
+
+    latency_ms = int((time.monotonic() - start) * 1000)
+
+    return {
+        "text": text,
+        "confidence": confidence,
+        "latency_ms": latency_ms,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "error": error,
+    }
+
+
+def run_benchmark(
+    label: str = "",
+    providers: list[str] | None = None,
+    strategies: list[str] | None = None,
+    domain: str = "biology",
+    sample_ids: list[int] | None = None,
+    db_path: Path | str | None = None,
+    on_progress: Callable[[int, int, str], None] | None = None,
+    mode: str = "full",
+    auto_enhance: bool = False,
+    inject_lessons: bool = False,
+) -> int:
+    """Execute a full benchmark run.
+
+    For each sample with ground truth:
+      - For each available provider: single-provider read
+      - For each consensus strategy (if 2+ providers): consensus read
+    Computes CER/WER against ground truth and stores everything.
+
+    Args:
+        label: Human-readable label for this run.
+        providers: Provider names to test. Default: all available.
+        strategies: Consensus strategies to test. Default: ['vote', 'best_of'].
+        domain: Domain for reading strategies.
+        sample_ids: Limit to specific sample IDs. Default: all with ground truth.
+        db_path: Override database path.
+        on_progress: Optional callback(current, total, message) for progress.
+        mode: 'full' (all samples) or 'smoke' (3 hardest samples only).
+        auto_enhance: Apply smart enhancement before reading (matches production).
+        inject_lessons: Inject lessons into vision prompts (matches production).
+
+    Returns:
+        The run ID.
+    """
+    conn = get_connection(db_path)
+    try:
+        return _run_benchmark_inner(
+            conn, label, providers, strategies, domain, sample_ids,
+            on_progress, mode, auto_enhance, inject_lessons,
+        )
+    finally:
+        conn.close()
+
+
+def _run_benchmark_inner(
+    conn,
+    label: str,
+    providers: list[str] | None,
+    strategies: list[str] | None,
+    domain: str,
+    sample_ids: list[int] | None,
+    on_progress: Callable[[int, int, str], None] | None,
+    mode: str,
+    auto_enhance: bool = False,
+    inject_lessons: bool = False,
+) -> int:
+    """Inner benchmark logic with connection managed by caller."""
+    # Resolve providers
+    avail = _available_providers()
+    if providers:
+        providers = [p for p in providers if p in avail]
+    else:
+        providers = avail
+
+    if not providers:
+        raise RuntimeError("No providers available. Install at least one SDK and set API key.")
+
+    # Default strategies
+    if strategies is None:
+        strategies = ["vote", "best_of"] if len(providers) >= 2 else []
+
+    # Get samples
+    samples = samples_with_ground_truth(conn)
+    if sample_ids:
+        samples = [s for s in samples if s.id in sample_ids]
+
+    # Smoke test mode: pick 3 hardest samples based on historical CER
+    if mode == "smoke":
+        samples = _select_smoke_samples(conn, samples, limit=3)
+
+    if not samples:
+        raise RuntimeError("No samples with ground truth. Run 'benchmark ingest' and 'benchmark transcribe' first.")
+
+    # Create run
+    all_strategies = ["single"] + strategies
+    run_id = insert_run(conn, label=label, providers=providers, strategies=all_strategies, domain=domain)
+    logger.info("Benchmark run %d: %d samples, providers=%s, strategies=%s", run_id, len(samples), providers, all_strategies)
+
+    evaluated = 0
+    total = len(samples)
+
+    for i, sample in enumerate(samples):
+        gt = get_latest_ground_truth(conn, sample.id)
+        if not gt:
+            continue
+
+        if not Path(sample.image_path).exists():
+            logger.warning("Image missing for sample %d: %s", sample.id, sample.image_path)
+            continue
+
+        if on_progress:
+            on_progress(i + 1, total, f"Sample {sample.id} ({sample.student or 'unknown'})")
+
+        # Single-provider reads
+        for provider in providers:
+            result = _read_single(sample.image_path, provider, domain, auto_enhance, inject_lessons)
+            po_id = insert_provider_output(
+                conn,
+                run_id=run_id,
+                sample_id=sample.id,
+                provider=provider,
+                strategy="single",
+                output_text=result["text"],
+                confidence=result["confidence"],
+                latency_ms=result["latency_ms"],
+                input_tokens=result["input_tokens"],
+                output_tokens=result["output_tokens"],
+                error=result["error"],
+                autocommit=False,
+            )
+
+            if not result["error"]:
+                cer, char_edits, ref_chars = character_error_rate(result["text"], gt.text)
+                wer, word_edits, ref_words = word_error_rate(result["text"], gt.text)
+                insert_eval_metric(
+                    conn, po_id, gt.id,
+                    cer=cer, wer=wer,
+                    char_edits=char_edits, word_edits=word_edits,
+                    ref_chars=ref_chars, ref_words=ref_words,
+                    autocommit=False,
+                )
+
+        # Consensus strategies (need 2+ providers)
+        if len(providers) >= 2:
+            for strategy in strategies:
+                result = _read_consensus(sample.image_path, providers, strategy, domain)
+                provider_label = "+".join(providers)
+                po_id = insert_provider_output(
+                    conn,
+                    run_id=run_id,
+                    sample_id=sample.id,
+                    provider=provider_label,
+                    strategy=strategy,
+                    output_text=result["text"],
+                    confidence=result["confidence"],
+                    latency_ms=result["latency_ms"],
+                    input_tokens=result["input_tokens"],
+                    output_tokens=result["output_tokens"],
+                    error=result["error"],
+                    autocommit=False,
+                )
+
+                if not result["error"]:
+                    cer, char_edits, ref_chars = character_error_rate(result["text"], gt.text)
+                    wer, word_edits, ref_words = word_error_rate(result["text"], gt.text)
+                    insert_eval_metric(
+                        conn, po_id, gt.id,
+                        cer=cer, wer=wer,
+                        char_edits=char_edits, word_edits=word_edits,
+                        ref_chars=ref_chars, ref_words=ref_words,
+                        autocommit=False,
+                    )
+
+        # Commit per sample (batch within sample, not per-row)
+        conn.commit()
+        evaluated += 1
+
+    finish_run(conn, run_id, evaluated)
+    logger.info("Benchmark run %d complete: %d samples evaluated", run_id, evaluated)
+    return run_id
+
+
+def _select_smoke_samples(conn, samples: list, limit: int = 3) -> list:
+    """Select the hardest samples for smoke testing based on historical CER."""
+    from handwriting_engine.benchmark.db import get_run_results, get_latest_run_id
+
+    latest_run = get_latest_run_id(conn)
+    if not latest_run:
+        return samples[:limit]
+
+    results = get_run_results(conn, latest_run)
+    # Average CER per sample
+    sample_cer: dict[int, list[float]] = {}
+    for r in results:
+        if r.get("cer") is not None:
+            sample_cer.setdefault(r["sample_id"], []).append(r["cer"])
+
+    sample_ids = {s.id for s in samples}
+    ranked = sorted(
+        ((sid, sum(cers) / len(cers)) for sid, cers in sample_cer.items() if sid in sample_ids),
+        key=lambda x: x[1],
+        reverse=True,
+    )
+
+    hard_ids = {sid for sid, _ in ranked[:limit]}
+    selected = [s for s in samples if s.id in hard_ids]
+
+    # Fill remaining slots if not enough history
+    if len(selected) < limit:
+        remaining = [s for s in samples if s.id not in hard_ids]
+        selected.extend(remaining[: limit - len(selected)])
+
+    return selected

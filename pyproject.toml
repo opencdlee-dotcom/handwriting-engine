@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "handwriting-engine"
+version = "0.1.0"
+description = "Unified handwriting recognition engine with multi-model consensus (Claude, GPT, Gemini)"
+requires-python = ">=3.11"
+dependencies = [
+    "Pillow>=10.0.0",
+    "PyMuPDF>=1.24.0",
+    "click>=8.1.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+claude = ["anthropic>=0.40.0"]
+openai = ["openai>=1.50.0"]
+gemini = ["google-genai>=1.0.0"]
+all = ["anthropic>=0.40.0", "openai>=1.50.0", "google-genai>=1.0.0"]
+benchmark = ["jiwer>=3.0.0", "numpy>=1.24.0"]
+dev = ["pytest>=8.0.0"]
+
+[project.scripts]
+handwriting-engine = "handwriting_engine.cli:cli"
+
+[tool.setuptools.packages.find]
+include = ["handwriting_engine*"]
