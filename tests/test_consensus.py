@@ -10,6 +10,7 @@ from handwriting_engine.consensus import (
     _word_diff,
     _word_agreement_ratio,
     _word_level_vote,
+    _count_uncertainty_markers,
     PROVIDER_WEIGHTS,
 )
 
@@ -332,3 +333,209 @@ def test_provider_weights_structure():
         assert "claude" in weights
         assert "openai" in weights
         assert "gemini" in weights
+
+
+# --- _count_uncertainty_markers ---
+
+def test_count_uncertainty_markers_none():
+    assert _count_uncertainty_markers("The student wrote mitosis") == 0
+
+
+def test_count_uncertainty_markers_question():
+    assert _count_uncertainty_markers("The [?] wrote [illegible: 3 chars]") == 2
+
+
+def test_count_uncertainty_markers_multiple():
+    text = "[?] [?] [unclear] ??? [illegible]"
+    count = _count_uncertainty_markers(text)
+    assert count >= 3
+
+
+# --- self_correct strategy ---
+
+class TestSelfCorrectStrategy:
+
+    def test_self_correct_calls_provider_twice(self):
+        """self_correct must call read_image twice: initial read + correction."""
+        call_count = [0]
+        responses = [
+            "The [?] wrote about mitosis",  # initial read with uncertainty
+            "The student wrote about mitosis",  # corrected read
+        ]
+
+        class CountingProvider:
+            name = "gemini"
+            _usage = {"input_tokens": 100, "output_tokens": 50}
+
+            def read_image(self, *args, **kwargs):
+                idx = call_count[0]
+                call_count[0] += 1
+                return responses[idx] if idx < len(responses) else responses[-1]
+
+            @property
+            def usage(self):
+                return dict(self._usage)
+
+        with patch("handwriting_engine.consensus.available_providers", return_value=["gemini"]), \
+             patch("handwriting_engine.consensus.get_provider", return_value=CountingProvider()):
+            result = read_with_consensus("b64", "image/jpeg", "read", strategy="self_correct")
+
+        assert call_count[0] == 2  # Initial + correction
+        assert result.strategy_used == "self_correct_1pass"
+        assert result.text == "The student wrote about mitosis"
+
+    def test_self_correct_no_extra_pass_when_clean(self):
+        """If initial read has no [?] markers, correction still runs once (max_rounds=1)."""
+        call_count = [0]
+
+        class CleanProvider:
+            name = "gemini"
+            _usage = {"input_tokens": 100, "output_tokens": 50}
+
+            def read_image(self, *args, **kwargs):
+                call_count[0] += 1
+                return "The student wrote about mitosis"
+
+            @property
+            def usage(self):
+                return dict(self._usage)
+
+        with patch("handwriting_engine.consensus.available_providers", return_value=["gemini"]), \
+             patch("handwriting_engine.consensus.get_provider", return_value=CleanProvider()):
+            result = read_with_consensus("b64", "image/jpeg", "read", strategy="self_correct")
+
+        assert call_count[0] == 2  # Always does at least 1 correction pass
+        assert result.strategy_used == "self_correct_1pass"
+
+    def test_self_correct_max_rounds_respected(self):
+        """max_self_correct_rounds=2 should do up to 2 correction passes."""
+        call_count = [0]
+        responses = [
+            "The [?] wrote [?] mitosis",    # initial
+            "The [?] wrote about mitosis",   # round 1 — still has [?]
+            "The student wrote about mitosis",  # round 2 — clean
+        ]
+
+        class MultiRoundProvider:
+            name = "gemini"
+            _usage = {"input_tokens": 100, "output_tokens": 50}
+
+            def read_image(self, *args, **kwargs):
+                idx = call_count[0]
+                call_count[0] += 1
+                return responses[idx] if idx < len(responses) else responses[-1]
+
+            @property
+            def usage(self):
+                return dict(self._usage)
+
+        with patch("handwriting_engine.consensus.available_providers", return_value=["gemini"]), \
+             patch("handwriting_engine.consensus.get_provider", return_value=MultiRoundProvider()):
+            result = read_with_consensus(
+                "b64", "image/jpeg", "read",
+                strategy="self_correct", max_self_correct_rounds=2
+            )
+
+        assert call_count[0] == 3  # initial + 2 correction passes
+        assert "2pass" in result.strategy_used
+        assert result.text == "The student wrote about mitosis"
+
+    def test_self_correct_strategy_used_field(self):
+        """strategy_used should reflect self_correct."""
+        mock = MagicMock()
+        mock.name = "gemini"
+        mock.read_image.return_value = "clean text without markers here"
+        mock.usage = {"input_tokens": 50, "output_tokens": 25}
+
+        with patch("handwriting_engine.consensus.available_providers", return_value=["gemini"]), \
+             patch("handwriting_engine.consensus.get_provider", return_value=mock):
+            result = read_with_consensus("b64", "image/jpeg", "read", strategy="self_correct")
+
+        assert "self_correct" in result.strategy_used
+
+    def test_self_correct_provider_results_has_initial_and_corrected(self):
+        """provider_results must contain 'initial' and 'corrected' keys."""
+        call_count = [0]
+
+        class TwoPassProvider:
+            name = "gemini"
+            _usage = {"input_tokens": 100, "output_tokens": 50}
+
+            def read_image(self, *args, **kwargs):
+                call_count[0] += 1
+                return "initial text" if call_count[0] == 1 else "corrected text"
+
+            @property
+            def usage(self):
+                return dict(self._usage)
+
+        with patch("handwriting_engine.consensus.available_providers", return_value=["gemini"]), \
+             patch("handwriting_engine.consensus.get_provider", return_value=TwoPassProvider()):
+            result = read_with_consensus("b64", "image/jpeg", "read", strategy="self_correct")
+
+        assert "initial" in result.provider_results
+        assert "corrected" in result.provider_results
+        assert result.provider_results["initial"] == "initial text"
+        assert result.provider_results["corrected"] == "corrected text"
+
+
+# --- smart strategy escalation ---
+
+class TestSmartEscalation:
+
+    def test_smart_escalates_on_high_uncertainty(self):
+        """smart strategy should escalate to self_correct when [?] count > threshold."""
+        call_count = [0]
+        responses = [
+            "[?] wrote [?] about [?] and [?] more",  # initial easy read — 4 [?] markers
+            "The student wrote about mitosis and cell division",  # self-correction
+        ]
+
+        class EscalatingProvider:
+            name = "gemini"
+            _usage = {"input_tokens": 100, "output_tokens": 50}
+
+            def read_image(self, *args, **kwargs):
+                idx = call_count[0]
+                call_count[0] += 1
+                return responses[idx] if idx < len(responses) else responses[-1]
+
+            @property
+            def usage(self):
+                return dict(self._usage)
+
+        good_quality = {"quality": "good", "blur_score": 200, "contrast_score": 0.7, "faint_ink": False, "issues": []}
+
+        with patch("handwriting_engine.consensus.available_providers", return_value=["gemini"]), \
+             patch("handwriting_engine.consensus.get_provider", return_value=EscalatingProvider()):
+            result = read_with_consensus(
+                "b64", "image/jpeg", "read",
+                strategy="smart",
+                quality_assessment=good_quality,
+                uncertainty_threshold=3,
+            )
+
+        assert "self_correct" in result.strategy_used
+
+    def test_smart_no_escalation_on_clean_output(self):
+        """smart strategy should NOT escalate when output is clean."""
+        mock = MagicMock()
+        mock.name = "gemini"
+        mock.read_image.return_value = "The student answered mitosis correctly"
+        mock.usage = {"input_tokens": 100, "output_tokens": 50}
+
+        good_quality = {"quality": "good", "blur_score": 200, "contrast_score": 0.7, "faint_ink": False, "issues": []}
+
+        with patch("handwriting_engine.consensus.available_providers", return_value=["gemini"]), \
+             patch("handwriting_engine.consensus.get_provider", return_value=mock):
+            result = read_with_consensus(
+                "b64", "image/jpeg", "read",
+                strategy="smart",
+                quality_assessment=good_quality,
+                uncertainty_threshold=3,
+            )
+
+        # Should be best_of (single read), not self_correct
+        assert "self_correct" not in result.strategy_used
+        # Only called once (best_of, no escalation)
+        assert mock.read_image.call_count == 1

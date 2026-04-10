@@ -734,12 +734,16 @@ def _cascade(
 def _smart_route(
     image_b64: str, media_type: str, prompt: str, system_prompt: str,
     quality_assessment: dict, content_type: str, max_tokens: int,
+    uncertainty_threshold: int = 3,
 ) -> ConsensusResult:
     """Adaptive routing based on image quality — spend API calls where they matter.
 
     Easy (sharp, high contrast): Single Gemini read — cheapest, best CER.
     Medium (fair quality, one issue): Gemini + cross-validator.
     Hard (poor, faint, multiple issues): Full vote with all providers.
+
+    After easy/medium reads, if [?] marker count exceeds uncertainty_threshold,
+    automatically escalates to self_correct for a correction pass.
     """
     from handwriting_engine._constants import (
         SMART_ROUTE_EASY_BLUR, SMART_ROUTE_EASY_CONTRAST,
@@ -768,11 +772,25 @@ def _smart_route(
 
     if difficulty == "easy":
         # Single best provider (Gemini) — cheapest and best CER
-        return _best_of(image_b64, media_type, prompt, system_prompt, content_type, max_tokens)
+        result = _best_of(image_b64, media_type, prompt, system_prompt, content_type, max_tokens)
+        marker_count = _count_uncertainty_markers(result.text)
+        if marker_count > uncertainty_threshold:
+            logger.info(f"Smart route: escalating to self_correct ({marker_count} markers > threshold {uncertainty_threshold})")
+            corrected = _self_correct(image_b64, media_type, prompt, system_prompt, content_type, max_tokens)
+            corrected.strategy_used = "smart→self_correct"
+            return corrected
+        return result
 
     elif difficulty == "medium":
         # Gemini + one cross-validator via cascade
-        return _cascade(image_b64, media_type, prompt, system_prompt, 0.7, max_tokens)
+        result = _cascade(image_b64, media_type, prompt, system_prompt, 0.7, max_tokens)
+        marker_count = _count_uncertainty_markers(result.text)
+        if marker_count > uncertainty_threshold:
+            logger.info(f"Smart route medium: escalating to self_correct ({marker_count} markers)")
+            corrected = _self_correct(image_b64, media_type, prompt, system_prompt, content_type, max_tokens)
+            corrected.strategy_used = "smart→self_correct"
+            return corrected
+        return result
 
     else:
         # Hard: full vote with all available providers
