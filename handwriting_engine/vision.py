@@ -38,7 +38,7 @@ _TRAILING_RE = re.compile(
 )
 
 
-def _postprocess_output(text: str) -> str:
+def _postprocess_output(text: str, domain: str | None = None) -> str:
     """Strip common LLM artifacts from transcription output.
 
     Removes preamble ("Here is the transcribed text:"), trailing commentary
@@ -84,6 +84,14 @@ def _postprocess_output(text: str) -> str:
         if seen[key] <= 2:
             deduped.append(line)
     result = '\n'.join(deduped)
+
+    # Domain spell correction (optional — only when domain is specified)
+    if domain:
+        try:
+            from handwriting_engine.postprocess import correct_domain_terms
+            result = correct_domain_terms(result, domain)
+        except Exception as e:
+            logger.warning("Domain correction failed: %s", e)
 
     return result.strip()
 
@@ -316,7 +324,7 @@ def read_page(
             _prov = get_provider(avail[0])
             line_text = read_page_by_lines(image_path, _prov, prompt, system_prompt or "", max_tokens)
             if line_text.strip():
-                return _postprocess_output(line_text) if postprocess else line_text
+                return _postprocess_output(line_text, domain=domain) if postprocess else line_text
         # Fall through to whole-page read if line segmentation fails
 
     p = get_provider(provider)
@@ -329,7 +337,7 @@ def read_page(
         raw = p.read_image(b64_data, media_type, prompt, system_prompt, max_tokens)
 
     if postprocess:
-        raw = _postprocess_output(raw)
+        raw = _postprocess_output(raw, domain=domain)
 
     # Auto-retry with enhancement comparison when confidence is low,
     # or zoomed crop verification when confidence is moderate but has [?] markers
@@ -349,14 +357,14 @@ def read_page(
                 image_path, domain=domain, provider=provider, enhance_strategy="proven",
             )
             if _single_text_confidence(retry) > confidence:
-                raw = _postprocess_output(retry) if postprocess else retry
+                raw = _postprocess_output(retry, domain=domain) if postprocess else retry
         elif confidence < ZOOM_VERIFY_CONFIDENCE_HIGH and marker_count >= ZOOM_VERIFY_MIN_MARKERS:
             # Moderate confidence with uncertainty markers — zoomed crop verification
             logger.info("Moderate confidence (%.2f) with %d markers, trying zoomed verification",
                         confidence, marker_count)
             verified = _zoomed_verify(image_path, raw, provider, system_prompt, max_tokens)
             if postprocess:
-                verified = _postprocess_output(verified)
+                verified = _postprocess_output(verified, domain=domain)
             verified_confidence = _single_text_confidence(verified)
             if verified_confidence > confidence:
                 raw = verified

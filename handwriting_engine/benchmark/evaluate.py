@@ -25,12 +25,7 @@ from handwriting_engine.benchmark.metrics import character_error_rate, word_erro
 
 logger = logging.getLogger(__name__)
 
-# Cost per 1M tokens (USD) — update as pricing changes
-COST_PER_1M_TOKENS = {
-    "claude": {"input": 3.00, "output": 15.00},
-    "gemini": {"input": 0.15, "output": 0.60},
-    "openai": {"input": 2.00, "output": 8.00},
-}
+from handwriting_engine._constants import COST_PER_1M_TOKENS
 
 
 def estimate_cost(input_tokens: int, output_tokens: int, provider: str) -> float:
@@ -64,11 +59,15 @@ def _read_single(
     from handwriting_engine.vision import read_page
 
     # Optionally enhance before reading (matches production pipeline)
+    # Always write to a temp file to avoid corrupting benchmark source images
     actual_path = image_path
     if auto_enhance:
         try:
+            import tempfile
             from handwriting_engine.enhance import enhance_image
-            actual_path = enhance_image(image_path, strategy="smart")
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+                tmp_path = f.name
+            actual_path = enhance_image(image_path, strategy="smart", output_path=tmp_path)
         except Exception:
             actual_path = image_path
 
@@ -143,8 +142,16 @@ def _read_consensus(
         )
         text = result.text
         confidence = result.confidence
-        input_tokens = result.tokens_used.get("input_tokens", 0)
-        output_tokens = result.tokens_used.get("output_tokens", 0)
+        # tokens_used may be flat {"input_tokens": N, "output_tokens": N}
+        # or nested by provider {"gemini": {"input_tokens": N, ...}}
+        tokens = result.tokens_used
+        if tokens and isinstance(next(iter(tokens.values()), None), dict):
+            # Nested: sum across all providers
+            input_tokens = sum(v.get("input_tokens", 0) for v in tokens.values() if isinstance(v, dict))
+            output_tokens = sum(v.get("output_tokens", 0) for v in tokens.values() if isinstance(v, dict))
+        else:
+            input_tokens = tokens.get("input_tokens", 0)
+            output_tokens = tokens.get("output_tokens", 0)
     except Exception as e:
         error = f"{type(e).__name__}: {e}"
         logger.warning("Consensus %s failed on %s: %s", strategy, image_path, error)
@@ -331,6 +338,86 @@ def _run_benchmark_inner(
     finish_run(conn, run_id, evaluated)
     logger.info("Benchmark run %d complete: %d samples evaluated", run_id, evaluated)
     return run_id
+
+
+def compare_strategies(
+    strategies: list[str],
+    domain: str = "biology",
+    db_path: Path | str | None = None,
+    regression_threshold: float = 0.5,
+) -> str:
+    """Run benchmark for each strategy and print a comparison table.
+
+    Args:
+        strategies: List of consensus strategy names, e.g. ['vote', 'best_of', 'self_correct'].
+        domain: Domain for reading strategies.
+        db_path: Override database path.
+        regression_threshold: Warn if CER increases by more than this many percentage points.
+
+    Returns:
+        Formatted comparison table as a string.
+    """
+    from handwriting_engine.benchmark.db import get_run_results
+    from handwriting_engine.benchmark.report import detect_regressions
+
+    results: list[dict] = []
+
+    for strategy in strategies:
+        label = f"compare-strategies:{strategy}"
+        run_id = run_benchmark(
+            label=label,
+            strategies=[strategy],
+            domain=domain,
+            db_path=db_path,
+        )
+        conn = get_connection(db_path)
+        try:
+            rows = get_run_results(conn, run_id)
+        finally:
+            conn.close()
+
+        if not rows:
+            results.append({"strategy": strategy, "cer": None, "wer": None, "samples": 0})
+            continue
+
+        cers = [r["cer"] for r in rows if r.get("cer") is not None]
+        wers = [r["wer"] for r in rows if r.get("wer") is not None]
+        avg_cer = sum(cers) / len(cers) if cers else None
+        avg_wer = sum(wers) / len(wers) if wers else None
+        results.append({
+            "strategy": strategy,
+            "cer": avg_cer,
+            "wer": avg_wer,
+            "samples": len(cers),
+            "run_id": run_id,
+        })
+
+        # Regression alerting: compare to previous run for this strategy
+        conn = get_connection(db_path)
+        try:
+            regressions = detect_regressions(conn, threshold=regression_threshold / 100.0)
+        finally:
+            conn.close()
+        for reg in regressions:
+            prev_pct = reg.get("prev_cer", 0) * 100
+            curr_pct = reg.get("current_cer", 0) * 100
+            print(
+                f"WARNING: CER regression detected: {prev_pct:.2f}% → {curr_pct:.2f}%"
+                f" (>{regression_threshold:.1f}% increase)"
+            )
+
+    # Format comparison table
+    lines = [
+        "Strategy Comparison:",
+        f"{'strategy':<20} | {'CER':>7} | {'WER':>7} | {'samples':>7}",
+        f"{'-'*20}-|-{'-'*7}-|-{'-'*7}-|-{'-'*7}",
+    ]
+    for r in results:
+        cer_str = f"{r['cer']*100:.2f}%" if r["cer"] is not None else "N/A"
+        wer_str = f"{r['wer']*100:.2f}%" if r["wer"] is not None else "N/A"
+        lines.append(f"{r['strategy']:<20} | {cer_str:>7} | {wer_str:>7} | {r['samples']:>7}")
+
+    return "\n".join(lines)
 
 
 def _select_smoke_samples(conn, samples: list, limit: int = 3) -> list:
