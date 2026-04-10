@@ -33,7 +33,7 @@ def get_provider(name: str, **kwargs) -> VisionProvider:
 
 def available_providers() -> list[str]:
     """List providers whose SDK is installed."""
-    for name in ("claude", "openai", "gemini"):
+    for name in ("claude", "openai", "gemini", "paddleocr", "trocr"):
         _try_autoload(name)
     return [name for name, cls in _REGISTRY.items() if cls.is_available()]
 
@@ -49,6 +49,10 @@ def _try_autoload(name: str):
             from handwriting_engine.providers import openai  # noqa: F401
         elif name == "gemini":
             from handwriting_engine.providers import gemini  # noqa: F401
+        elif name == "paddleocr":
+            from handwriting_engine.providers import paddleocr_provider  # noqa: F401
+        elif name == "trocr":
+            from handwriting_engine.providers import trocr_provider  # noqa: F401
     except ImportError:
         pass
 
