@@ -10,11 +10,184 @@ import logging
 import os
 from pathlib import Path
 
+import re
+
+from PIL import Image
+
 from handwriting_engine._constants import MAX_IMAGE_LONG_SIDE, JPEG_QUALITY
 from handwriting_engine.providers import get_provider, available_providers
 from handwriting_engine.providers.base import ConsensusResult
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Post-processing — strip common LLM artifacts from transcriptions
+# ---------------------------------------------------------------------------
+
+_PREAMBLE_RE = re.compile(
+    r"^(Here is|The transcribed|The handwritten|I can see|The text reads|"
+    r"Transcription:|Below is|The following|The image shows|I'll transcribe)"
+    r"[^\n]*\n",
+    re.IGNORECASE,
+)
+
+_TRAILING_RE = re.compile(
+    r"\n(Note:|Please note|Some words|I was unable|Disclaimer|The handwriting|"
+    r"I hope|Let me know|If you need|Overall)[^\n]*$",
+    re.IGNORECASE,
+)
+
+
+def _postprocess_output(text: str) -> str:
+    """Strip common LLM artifacts from transcription output.
+
+    Removes preamble ("Here is the transcribed text:"), trailing commentary
+    ("Note: some words were difficult to read"), markdown formatting artifacts,
+    and deduplicates repeated sentences.
+    """
+    if not text or not text.strip():
+        return ""
+
+    result = text
+
+    # 1. Strip preamble (first 1-3 lines only)
+    for _ in range(3):
+        m = _PREAMBLE_RE.match(result)
+        if m:
+            result = result[m.end():]
+        else:
+            break
+
+    # 2. Strip trailing meta-commentary (last lines)
+    for _ in range(3):
+        m = _TRAILING_RE.search(result)
+        if m:
+            result = result[:m.start()]
+        else:
+            break
+
+    # 3. Remove markdown artifacts from plain transcription
+    result = re.sub(r'\*\*([^*]+)\*\*', r'\1', result)  # **bold** → bold
+    result = re.sub(r'^#{1,3}\s+', '', result, flags=re.MULTILINE)  # # headers
+    result = re.sub(r'(?<!\w)_([^_]+)_(?!\w)', r'\1', result)  # _italic_
+
+    # 4. Deduplicate sentences appearing 3+ times
+    lines = result.split('\n')
+    seen: dict[str, int] = {}
+    deduped = []
+    for line in lines:
+        key = line.strip().lower()
+        if not key:
+            deduped.append(line)
+            continue
+        seen[key] = seen.get(key, 0) + 1
+        if seen[key] <= 2:
+            deduped.append(line)
+    result = '\n'.join(deduped)
+
+    return result.strip()
+
+
+def _extract_vocabulary_hints(image_b64: str, media_type: str) -> list[str]:
+    """Cheap pre-scan to extract clearly legible words for vocabulary priming.
+
+    Uses Gemini Flash (cheapest provider) with minimal tokens to identify
+    domain terms that are clearly visible. These are then injected as
+    vocabulary_hints for the full read, helping the model resolve ambiguous
+    characters in context.
+    """
+    from handwriting_engine._constants import VOCAB_PRIMING_MAX_TOKENS
+
+    try:
+        avail = available_providers()
+        # Prefer gemini (cheapest), fall back to whatever is available
+        provider_name = "gemini" if "gemini" in avail else avail[0] if avail else None
+        if not provider_name:
+            return []
+        p = get_provider(provider_name)
+        result = p.read_image(
+            image_b64, media_type,
+            "List all clearly legible words from this handwritten image. "
+            "Output ONLY the words, comma-separated. Focus on technical or scientific terms.",
+            "",  # No system prompt for speed
+            VOCAB_PRIMING_MAX_TOKENS,
+        )
+        # Parse comma-separated words, deduplicate, limit to 50
+        words = [w.strip() for w in result.split(",") if w.strip()]
+        seen = set()
+        unique = []
+        for w in words:
+            low = w.lower()
+            if low not in seen and len(w) > 2:
+                seen.add(low)
+                unique.append(w)
+        return unique[:50]
+    except Exception as e:
+        logger.warning("Vocabulary priming failed: %s", e)
+        return []
+
+
+def _dual_polarity_read(
+    image_path: str,
+    b64_data: str,
+    media_type: str,
+    provider_obj,
+    prompt: str,
+    system_prompt: str,
+    max_tokens: int,
+) -> str:
+    """Read both original and color-inverted versions for faint ink.
+
+    Faint pencil strokes invisible on white paper pop against a dark background
+    in the inverted version. The LLM's vision encoder activates different feature
+    channels on inverted images. Returns the cleaner result or a merged version.
+    """
+    import io
+    import base64
+    from PIL import ImageOps
+
+    # Normal read
+    normal_text = provider_obj.read_image(b64_data, media_type, prompt, system_prompt, max_tokens)
+
+    # Create inverted image
+    try:
+        img = Image.open(image_path)
+        img.load()
+        if img.mode == "RGBA":
+            img = img.convert("RGB")
+        elif img.mode != "RGB":
+            img = img.convert("RGB")
+        inverted = ImageOps.invert(img)
+        buf = io.BytesIO()
+        inverted.save(buf, format="JPEG", quality=90)
+        inv_b64 = base64.standard_b64encode(buf.getvalue()).decode("utf-8")
+        inverted.close()
+        img.close()
+    except Exception as e:
+        logger.warning("Dual-polarity inversion failed: %s", e)
+        return normal_text
+
+    inv_prompt = (
+        "This is a color-inverted version of handwritten text (dark background, light text). "
+        "Read all text carefully, focusing on faint characters that may be more visible "
+        "in this inverted view. " + prompt
+    )
+    try:
+        inverted_text = provider_obj.read_image(inv_b64, "image/jpeg", inv_prompt, system_prompt, max_tokens)
+    except Exception as e:
+        logger.warning("Dual-polarity inverted read failed: %s", e)
+        return normal_text
+
+    # Pick the cleaner result (fewer uncertainty markers)
+    marker_re = re.compile(r"\[\?\]|\?\?\?|\[illegible[^\]]*\]", re.IGNORECASE)
+    normal_markers = len(marker_re.findall(normal_text))
+    inverted_markers = len(marker_re.findall(inverted_text))
+
+    if inverted_markers < normal_markers:
+        logger.info("Dual-polarity: inverted version cleaner (%d vs %d markers)",
+                     inverted_markers, normal_markers)
+        return inverted_text
+    return normal_text
 
 
 def read_page(
@@ -28,19 +201,35 @@ def read_page(
     auto_enhance: bool = False,
     inject_lessons: bool = True,
     writer_id: str | None = None,
+    vocabulary_hints: list[str] | None = None,
+    postprocess: bool = True,
+    auto_retry: bool = False,
+    auto_classify: bool = False,
+    vocab_priming: bool = False,
+    line_level: bool = False,
 ) -> str:
     """
     Read a single handwritten page.
     Injects reading strategies and disambiguation rules by default.
 
     Args:
-        auto_enhance: If True, assess image quality and enhance if needed
-                      before reading. Uses 'proven' strategy for poor images.
-        inject_lessons: If True, prepend learned lessons from past corrections
-                        into the system prompt.
+        auto_enhance: If True, assess image quality and enhance if needed.
+                      Uses 'proven' strategy for faint/poor images, 'adaptive' for fair.
+        inject_lessons: If True, prepend learned lessons from past corrections.
+        postprocess: If True, strip LLM preamble, trailing commentary, markdown artifacts.
+        auto_retry: If True, retry with enhancement comparison when confidence is low.
+        auto_classify: If True, classify handwriting style (cursive/print) and use
+                       for content-type-specific reading strategies.
     """
     from handwriting_engine.optimize import validate_and_prepare_image
     from handwriting_engine.handwriting import get_reading_strategies
+
+    # Classify handwriting style for content-type-aware routing
+    detected_content_type = "default"
+    if auto_classify:
+        from handwriting_engine.quality import classify_handwriting_style
+        style = classify_handwriting_style(image_path)
+        detected_content_type = {"cursive": "cursive", "print": "printed", "mixed": "handwriting"}.get(style, "default")
 
     assessment = None
     if auto_enhance:
@@ -49,10 +238,15 @@ def read_page(
         from handwriting_engine.enhance import enhance_image
         assessment = assess_image(image_path)
         if assessment["quality"] != "good":
+            # Use proven for faint/poor (15-20% CER improvement), adaptive for fair
+            if assessment.get("faint_ink") or assessment["quality"] == "poor":
+                strategy = "proven"
+            else:
+                strategy = "adaptive"
             suffix = os.path.splitext(image_path)[1] or ".jpg"
             tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
             tmp.close()
-            image_path = enhance_image(image_path, strategy="adaptive", output_path=tmp.name)
+            image_path = enhance_image(image_path, strategy=strategy, output_path=tmp.name)
 
     # Prepare faint content protocol injection if quality assessment detects faint ink
     if assessment and assessment.get("faint_ink"):
@@ -73,12 +267,14 @@ def read_page(
             "Read all handwritten text in this image carefully. "
             "Preserve original spelling and formatting exactly as written. "
             "For any character you are less than 80% sure about, mark it with [?]. "
-            "If a region is completely illegible, write [illegible: ~N chars]."
+            "If a region is completely illegible, write [illegible: ~N chars]. "
+            "For names: read letter by letter, flag the whole name with [?] if any letter is uncertain. "
+            "Do NOT guess — if unsure, flag it rather than producing a confident wrong reading."
         )
 
     # Reading strategies go in system prompt (enables prompt caching, better model attention)
     if inject_strategies:
-        strategies = get_reading_strategies(domain=domain, content_type="default")
+        strategies = get_reading_strategies(domain=domain, content_type=detected_content_type)
         system_prompt = strategies + ("\n\n" + system_prompt if system_prompt else "")
 
     # Inject faint content protocol when image has faint ink
@@ -99,8 +295,183 @@ def read_page(
         if writer_cal:
             system_prompt = (system_prompt + "\n\n" + writer_cal) if system_prompt else writer_cal
 
+    # Auto-extract vocabulary hints via cheap pre-scan when vocab_priming is enabled
+    if vocab_priming and not vocabulary_hints:
+        vocabulary_hints = _extract_vocabulary_hints(b64_data, media_type)
+
+    # Inject vocabulary hints (research sweet spot: 20-50 terms)
+    if vocabulary_hints:
+        hint_text = "Expected vocabulary includes: " + ", ".join(vocabulary_hints[:50])
+        system_prompt = (system_prompt + "\n\n" + hint_text) if system_prompt else hint_text
+
+    # Adapt prompts for provider-specific optimization
+    from handwriting_engine.prompt_adapter import adapt_system_prompt, adapt_user_prompt
+    system_prompt = adapt_system_prompt(system_prompt, provider)
+    prompt = adapt_user_prompt(prompt, provider)
+
+    if line_level:
+        from handwriting_engine.line_reader import read_page_by_lines
+        avail = available_providers()
+        if avail:
+            _prov = get_provider(avail[0])
+            line_text = read_page_by_lines(image_path, _prov, prompt, system_prompt or "", max_tokens)
+            if line_text.strip():
+                return _postprocess_output(line_text) if postprocess else line_text
+        # Fall through to whole-page read if line segmentation fails
+
     p = get_provider(provider)
-    return p.read_image(b64_data, media_type, prompt, system_prompt, max_tokens)
+
+    # Dual-polarity reading for faint ink: send both normal and inverted images
+    from handwriting_engine._constants import DUAL_POLARITY_ENABLED
+    if DUAL_POLARITY_ENABLED and assessment and assessment.get("faint_ink"):
+        raw = _dual_polarity_read(image_path, b64_data, media_type, p, prompt, system_prompt, max_tokens)
+    else:
+        raw = p.read_image(b64_data, media_type, prompt, system_prompt, max_tokens)
+
+    if postprocess:
+        raw = _postprocess_output(raw)
+
+    # Auto-retry with enhancement comparison when confidence is low,
+    # or zoomed crop verification when confidence is moderate but has [?] markers
+    if auto_retry:
+        from handwriting_engine.consensus import _single_text_confidence
+        from handwriting_engine._constants import (
+            ZOOM_VERIFY_CONFIDENCE_LOW, ZOOM_VERIFY_CONFIDENCE_HIGH,
+            ZOOM_VERIFY_MIN_MARKERS,
+        )
+        confidence = _single_text_confidence(raw)
+        marker_count = len(re.findall(r"\[\?\]|\?\?\?|\[illegible[^\]]*\]", raw, re.IGNORECASE))
+
+        if confidence < ZOOM_VERIFY_CONFIDENCE_LOW:
+            # Very low confidence — full retry with enhancement comparison
+            logger.info("Low confidence (%.2f), retrying with enhancement comparison", confidence)
+            retry = read_with_enhancement_comparison(
+                image_path, domain=domain, provider=provider, enhance_strategy="proven",
+            )
+            if _single_text_confidence(retry) > confidence:
+                raw = _postprocess_output(retry) if postprocess else retry
+        elif confidence < ZOOM_VERIFY_CONFIDENCE_HIGH and marker_count >= ZOOM_VERIFY_MIN_MARKERS:
+            # Moderate confidence with uncertainty markers — zoomed crop verification
+            logger.info("Moderate confidence (%.2f) with %d markers, trying zoomed verification",
+                        confidence, marker_count)
+            verified = _zoomed_verify(image_path, raw, provider, system_prompt, max_tokens)
+            if postprocess:
+                verified = _postprocess_output(verified)
+            verified_confidence = _single_text_confidence(verified)
+            if verified_confidence > confidence:
+                raw = verified
+
+    return raw
+
+
+def _zoomed_verify(
+    image_path: str,
+    text: str,
+    provider: str,
+    system_prompt: str,
+    max_tokens: int = 4096,
+) -> str:
+    """Re-read uncertain regions at higher resolution to resolve [?] markers.
+
+    Splits the page into horizontal strips, identifies which strips contain
+    uncertain text (by mapping [?] positions to line thirds), and re-sends
+    those strips at 2x resolution with a focused verification prompt.
+    """
+    from handwriting_engine._constants import ZOOM_VERIFY_STRIPS
+    from handwriting_engine.optimize import validate_and_prepare_image
+
+    # Find [?] marker positions within the text (by line number)
+    lines = text.split("\n")
+    total_lines = len(lines)
+    if total_lines == 0:
+        return text
+
+    uncertain_lines = set()
+    for i, line in enumerate(lines):
+        if "[?]" in line or "???" in line or re.search(r"\[illegible[^\]]*\]", line, re.IGNORECASE):
+            uncertain_lines.add(i)
+
+    if not uncertain_lines:
+        return text
+
+    # Map uncertain lines to image strips
+    strip_count = min(ZOOM_VERIFY_STRIPS, total_lines)
+    if strip_count < 1:
+        return text
+    lines_per_strip = total_lines / strip_count
+    uncertain_strips = set()
+    for line_idx in uncertain_lines:
+        strip_idx = min(int(line_idx / lines_per_strip), strip_count - 1)
+        uncertain_strips.add(strip_idx)
+
+    # Crop uncertain strips from the original image and re-read
+    try:
+        img = Image.open(image_path)
+        img.load()
+    except (IOError, OSError):
+        return text
+
+    w, h = img.size
+    strip_height = h // strip_count
+    p = get_provider(provider)
+    replacements = {}
+
+    for strip_idx in sorted(uncertain_strips):
+        y_start = strip_idx * strip_height
+        y_end = h if strip_idx == strip_count - 1 else (strip_idx + 1) * strip_height
+        # Add 10% overlap to avoid cutting through text lines
+        overlap = int(strip_height * 0.1)
+        y_start = max(0, y_start - overlap)
+        y_end = min(h, y_end + overlap)
+
+        strip_img = img.crop((0, y_start, w, y_end))
+
+        # Upscale 2x for better resolution on the cropped region
+        strip_img = strip_img.resize((w * 2, (y_end - y_start) * 2), Image.LANCZOS)
+
+        # Convert to base64
+        import io, base64
+        if strip_img.mode not in ("RGB", "L"):
+            strip_img = strip_img.convert("RGB")
+        buf = io.BytesIO()
+        strip_img.save(buf, format="JPEG", quality=95)
+        b64_data = base64.standard_b64encode(buf.getvalue()).decode("utf-8")
+        strip_img.close()
+
+        # Context: which lines from the original reading correspond to this strip
+        line_start = int(strip_idx * lines_per_strip)
+        line_end = min(total_lines, int((strip_idx + 1) * lines_per_strip))
+        context_text = "\n".join(lines[line_start:line_end])
+
+        verify_prompt = (
+            f"This is a zoomed-in section of a handwritten page. "
+            f"A previous reading of this section produced:\n\n"
+            f"\"{context_text}\"\n\n"
+            f"Characters marked with [?] or [illegible] need verification. "
+            f"Please read this section carefully and provide the corrected text. "
+            f"Only output the text for this section, preserving original spelling."
+        )
+
+        try:
+            strip_read = p.read_image(b64_data, "image/jpeg", verify_prompt, system_prompt, max_tokens)
+            if strip_read.strip():
+                replacements[strip_idx] = (line_start, line_end, strip_read.strip())
+        except Exception as e:
+            logger.warning(f"Zoomed verify failed for strip {strip_idx}: {e}")
+
+    img.close()
+
+    if not replacements:
+        return text
+
+    # Rebuild text: replace uncertain strip lines with zoomed readings
+    result_lines = list(lines)
+    for strip_idx in sorted(replacements.keys(), reverse=True):
+        line_start, line_end, new_text = replacements[strip_idx]
+        new_lines = new_text.split("\n")
+        result_lines[line_start:line_end] = new_lines
+
+    return "\n".join(result_lines)
 
 
 def read_all_pages(
@@ -145,6 +516,8 @@ def read_with_consensus(
     inject_strategies: bool = True,
     inject_lessons: bool = True,
     writer_id: str | None = None,
+    vocabulary_hints: list[str] | None = None,
+    auto_classify: bool = False,
 ) -> ConsensusResult:
     """
     Read a page using multi-model consensus.
@@ -152,6 +525,12 @@ def read_with_consensus(
     from handwriting_engine.optimize import validate_and_prepare_image
     from handwriting_engine.handwriting import get_reading_strategies
     from handwriting_engine.consensus import read_with_consensus as _consensus
+
+    # Auto-classify handwriting style for content-type-aware provider routing
+    if auto_classify and content_type == "default":
+        from handwriting_engine.quality import classify_handwriting_style
+        style = classify_handwriting_style(image_path)
+        content_type = {"cursive": "cursive", "print": "printed", "mixed": "handwriting"}.get(style, "default")
 
     result = validate_and_prepare_image(image_path)
     if result is None:
@@ -164,7 +543,9 @@ def read_with_consensus(
             "Read all handwritten text in this image carefully. "
             "Preserve original spelling and formatting exactly as written. "
             "For any character you are less than 80% sure about, mark it with [?]. "
-            "If a region is completely illegible, write [illegible: ~N chars]."
+            "If a region is completely illegible, write [illegible: ~N chars]. "
+            "For names: read letter by letter, flag the whole name with [?] if any letter is uncertain. "
+            "Do NOT guess — if unsure, flag it rather than producing a confident wrong reading."
         )
 
     # Reading strategies go in system prompt for better model attention + caching
@@ -187,6 +568,17 @@ def read_with_consensus(
         if writer_cal:
             system_prompt = (system_prompt + "\n\n" + writer_cal) if system_prompt else writer_cal
 
+    # Inject vocabulary hints (research sweet spot: 20-50 terms)
+    if vocabulary_hints:
+        hint_text = "Expected vocabulary includes: " + ", ".join(vocabulary_hints[:50])
+        system_prompt = (system_prompt + "\n\n" + hint_text) if system_prompt else hint_text
+
+    # For smart routing, assess image quality and pass to consensus
+    quality_assessment = None
+    if strategy == "smart":
+        from handwriting_engine.quality import assess_image
+        quality_assessment = assess_image(image_path)
+
     return _consensus(
         image_b64=b64_data,
         media_type=media_type,
@@ -195,6 +587,7 @@ def read_with_consensus(
         providers=providers,
         strategy=strategy,
         content_type=content_type,
+        quality_assessment=quality_assessment,
     )
 
 
