@@ -101,3 +101,22 @@ def test_rgba_preservation():
     assert enhanced.mode == "RGBA", "Alpha channel must be preserved"
     os.unlink(path)
     os.unlink(out)
+
+
+def test_sauvola_enhance_returns_path(tmp_path):
+    """sauvola_enhance should return a path without crashing."""
+    from handwriting_engine.enhance import sauvola_enhance, enhance_image
+    img = Image.new("RGB", (200, 100), color=(200, 200, 200))
+    path = str(tmp_path / "test.jpg")
+    img.save(path)
+    result = sauvola_enhance(path)
+    assert result == path
+
+
+def test_enhance_image_sauvola_strategy(tmp_path):
+    from handwriting_engine.enhance import enhance_image
+    img = Image.new("RGB", (200, 100), color=(200, 200, 200))
+    path = str(tmp_path / "test.jpg")
+    img.save(path)
+    result = enhance_image(path, strategy="sauvola")
+    assert result == path

@@ -16,9 +16,14 @@ can be tuned in one place.
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Optional
 
+logger = logging.getLogger(__name__)
+
+import cv2
+import numpy as np
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageStat
 
 from handwriting_engine._constants import (
@@ -119,6 +124,13 @@ def _enhance_denoise(img: Image.Image) -> Image.Image:
     return img.filter(ImageFilter.MedianFilter(size=3))
 
 
+def _deskew(img: Image.Image, angle: float) -> Image.Image:
+    """Rotate image to correct detected skew. Fills exposed corners with white."""
+    if abs(angle) < 0.1:
+        return img
+    return img.rotate(angle, expand=True, fillcolor=(255, 255, 255) if img.mode == "RGB" else 255)
+
+
 # ---------------------------------------------------------------------------
 # High-level strategies
 # ---------------------------------------------------------------------------
@@ -159,6 +171,11 @@ def smart_enhance(
 
     img = Image.open(image_path)
     img, alpha = _strip_alpha(img)
+
+    # Deskew first — straighten before any other enhancement
+    skew_angle = assessment.get("skew_angle", 0.0)
+    if skew_angle:
+        img = _deskew(img, skew_angle)
 
     heavy = assessment["quality"] == "poor"
     faint = assessment.get("faint_ink", False)
@@ -399,6 +416,10 @@ def adaptive_enhance(
     img = Image.open(image_path)
     img, alpha = _strip_alpha(img)
 
+    # Deskew first — straighten before any other enhancement
+    if assessment.get("skew_angle"):
+        img = _deskew(img, assessment["skew_angle"])
+
     if params.get("denoise"):
         img = _enhance_denoise(img)
 
@@ -420,6 +441,144 @@ def adaptive_enhance(
     dest = output_path or image_path
     _save(img, dest)
     img.close()
+    return dest
+
+
+# ---------------------------------------------------------------------------
+# CLAHE + Lined Paper Removal
+# ---------------------------------------------------------------------------
+
+
+def clahe_enhance(
+    image_path: str,
+    output_path: Optional[str] = None,
+    clip_limit: float = 3.0,
+    tile_grid: int = 8,
+) -> str:
+    """
+    CLAHE (Contrast Limited Adaptive Histogram Equalization) enhancement.
+
+    Handles non-uniform illumination from flatbed scanners far better than
+    global contrast stretching.  Primary use: faint ink on non-uniform
+    backgrounds.
+
+    Parameters
+    ----------
+    clip_limit : float
+        2.0 for mild faint, 3.0 for clearly faint, 4.0 for very faint pencil.
+    tile_grid : int
+        Grid size for local histogram regions.  8 for full pages, 4 for
+        narrow crops like name fields.
+    """
+    img = Image.open(image_path)
+    img_rgb, alpha = _strip_alpha(img)
+
+    arr = cv2.cvtColor(np.array(img_rgb), cv2.COLOR_RGB2GRAY)
+    clahe = cv2.createCLAHE(
+        clipLimit=clip_limit, tileGridSize=(tile_grid, tile_grid)
+    )
+    enhanced = clahe.apply(arr)
+
+    # Convert back to RGB
+    enhanced_rgb = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2RGB)
+    result = Image.fromarray(enhanced_rgb)
+
+    # Light unsharp mask to define stroke edges without noise amplification
+    result = result.filter(
+        ImageFilter.UnsharpMask(radius=1.5, percent=150, threshold=1)
+    )
+
+    result = _restore_alpha(result, alpha)
+    dest = output_path or image_path
+    _save(result, dest)
+    return dest
+
+
+def sauvola_enhance(
+    image_path: str,
+    output_path: Optional[str] = None,
+    window_size: int = 25,
+    k: float = 0.2,
+) -> str:
+    """Sauvola adaptive binarization — best for degraded docs with uneven illumination.
+
+    MDPI Electronics 2024 review: adaptive local methods (Sauvola, Niblack)
+    outperform global Otsu for documents with non-uniform backgrounds.
+
+    Args:
+        window_size: Local window size for threshold computation (odd number).
+        k: Sauvola sensitivity parameter (0.1 = less aggressive, 0.5 = more).
+
+    Falls back to clahe_enhance() if scikit-image is not installed.
+    """
+    try:
+        from skimage.filters import threshold_sauvola
+    except ImportError:
+        logger.warning("scikit-image not installed, falling back to clahe_enhance")
+        return clahe_enhance(image_path, output_path=output_path)
+
+    img = Image.open(image_path)
+    img_rgb, alpha = _strip_alpha(img)
+
+    # Convert to grayscale for Sauvola
+    gray = np.array(img_rgb.convert("L"))
+
+    # Compute Sauvola threshold map
+    thresh = threshold_sauvola(gray, window_size=window_size, k=k)
+    binary = (gray > thresh).astype(np.uint8) * 255
+
+    # Convert binary back to RGB
+    result_rgb = cv2.cvtColor(binary, cv2.COLOR_GRAY2RGB)
+    result = Image.fromarray(result_rgb)
+
+    result = _restore_alpha(result, alpha)
+    dest = output_path or image_path
+    _save(result, dest)
+    return dest
+
+
+def remove_horizontal_lines(
+    image_path: str,
+    output_path: Optional[str] = None,
+    line_length_ratio: float = 0.5,
+) -> str:
+    """
+    Remove ruled paper lines while preserving handwritten strokes.
+
+    Uses morphological opening to detect horizontal structures spanning at
+    least *line_length_ratio* of the page width, then subtracts them.
+    A small vertical dilation repairs letter strokes cut by line removal.
+
+    Parameters
+    ----------
+    line_length_ratio : float
+        Minimum fraction of page width for a structure to count as a
+        ruling line.  Default 0.5 safely preserves letter crossbars.
+    """
+    img = Image.open(image_path)
+    img_rgb, alpha = _strip_alpha(img)
+
+    arr = cv2.cvtColor(np.array(img_rgb), cv2.COLOR_RGB2GRAY)
+    _, binary = cv2.threshold(
+        arr, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+    )
+
+    h, w = binary.shape
+    kernel_w = max(30, int(w * line_length_ratio))
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_w, 1))
+    lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, h_kernel, iterations=2)
+
+    # Repair strokes cut by line removal
+    repair = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3))
+    lines = cv2.dilate(lines, repair, iterations=1)
+
+    result_gray = cv2.add(arr, lines)
+    result_rgb = cv2.cvtColor(result_gray, cv2.COLOR_GRAY2RGB)
+    result = Image.fromarray(result_rgb)
+
+    result = _restore_alpha(result, alpha)
+    dest = output_path or image_path
+    _save(result, dest)
     return dest
 
 
@@ -469,6 +628,9 @@ def enhance_image(
     if strategy == "llm":
         return llm_enhance(image_path, output_path=output_path)
 
+    if strategy == "clahe":
+        return clahe_enhance(image_path, output_path=output_path)
+
     if strategy in ("light", "medium", "heavy"):
         return crisp(image_path, strength=strategy, output_path=output_path)
 
@@ -481,7 +643,10 @@ def enhance_image(
         }
         return smart_enhance(image_path, assessment=forced_assessment, output_path=output_path)
 
+    if strategy == "sauvola":
+        return sauvola_enhance(image_path, output_path=output_path)
+
     raise ValueError(
         f"Unknown enhancement strategy {strategy!r}. "
-        f"Choose from: smart, adaptive, proven, llm, light, medium, heavy, full"
+        f"Choose from: smart, adaptive, proven, llm, clahe, sauvola, light, medium, heavy, full"
     )
