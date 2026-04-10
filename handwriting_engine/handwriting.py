@@ -207,18 +207,22 @@ When a table is detected:
 
 SINGLE_LETTER_PROTOCOL = """
 === SINGLE-LETTER ANSWER PROTOCOL (FILL-IN / MATCHING) ===
-When the expected answer is a SINGLE CAPITAL LETTER (matching questions,
-fill-in-the-blank with letter choices), apply EXTRA scrutiny:
+Single-letter and single-character answers are the HIGHEST RISK category
+for hallucination. A model that confidently reports "B" when the actual
+letter is "D" causes silent misgrading. Default to AMBIGUOUS.
 
 DUAL-READ PROCEDURE:
 1. First read: identify the letter based on raw stroke structure alone
 2. Second read: identify the letter considering answer-key context
-3. Compare: if both reads agree, confidence = HIGH
+3. Compare: if both reads agree, confidence = MEDIUM (not HIGH — single
+   characters never have enough visual evidence for HIGH confidence)
 4. If they disagree, report BOTH and set confidence = LOW
 
 RULES:
 1. NEVER guess a single letter -- examine stroke structure methodically
-2. For each letter, report your TWO most likely readings: "Primary: B, Alt: D"
+2. For EVERY single-letter answer, ALWAYS report TWO readings:
+   "Primary: B, Alt: D" — even when you feel confident. Omitting the
+   alternate is how silent misgrading happens.
 3. Check the student's OTHER single-letter answers on the same page to calibrate:
    - How does THIS student form B vs D? H vs K? G vs C?
    - Use consistent interpretation across all their answers
@@ -227,11 +231,68 @@ RULES:
    as LOW
 5. HIGH-RISK PAIRS to watch for specifically:
    B/D, O/Q, G/C, M/N, H/A, L/I, P/F, K/R, E/F, J/I
+6. DEFAULT AMBIGUOUS: If you cannot articulate WHY a letter is one reading
+   vs its confusion pair (specific stroke feature), mark it AMBIGUOUS.
+   "It looks like B" is not sufficient — you must cite: "closed double loop
+   on right side = B, not D's single curve."
 """.strip()
 
 # ---------------------------------------------------------------------------
 # Faint content protocol -- injected when quality assessment detects faint ink
 # ---------------------------------------------------------------------------
+
+ANTI_HALLUCINATION_PROTOCOL = """
+=== ANTI-HALLUCINATION PROTOCOL ===
+Vision models hallucinate plausible-but-wrong text, especially:
+
+1. NAMES: Highest hallucination risk. A model may read "Sheldon" as
+   "Steffon Espericueta" — generating a confident, detailed name that
+   is entirely wrong. When reading names:
+   - Read letter by letter, do NOT guess the whole name at once
+   - If ANY letter is uncertain, flag the entire name with [?]
+   - NEVER expand ambiguous strokes into a longer, more specific reading
+   - A 4-letter name should NOT become a 20-letter name
+   - Prefer the shorter reading when length is ambiguous
+
+2. SHORT ANSWERS (1-3 words): High specificity + low visual evidence =
+   hallucination signal. For short answers:
+   - Default confidence to LOW unless every character is crystal clear
+   - If the answer seems surprisingly specific for unclear handwriting,
+     that IS the hallucination — flag it with [?]
+   - A blurry single word should produce "[?]word[?]", not a clean reading
+
+3. CONFIDENCE CALIBRATION: If you are about to output a reading without
+   ANY [?] markers, ask yourself: "Am I truly certain about every single
+   character, or am I filling in gaps with plausible guesses?"
+   - Absent [?] markers should be RARE for handwritten text
+   - For faint, small, or cramped text: use [?] liberally
+   - Better to over-flag than to silently hallucinate
+
+4. LENGTH MISMATCH: If your reading is significantly longer or shorter
+   than what the physical space on the page suggests, re-examine.
+   Models tend to generate MORE text than is actually written.
+""".strip()
+
+SELF_CORRECTION_PROMPT = """
+=== SELF-CORRECTION REVIEW ===
+You previously produced the following transcription of this handwritten image:
+
+---
+{initial_transcription}
+---
+
+Review your transcription against the actual image. Look specifically for:
+
+1. CHARACTER CONFUSION: Check every character against the top confusion pairs:
+   - 1/l/I, 0/O, rn/m, 5/S, u/v, a/o, cl/d, n/h, e/c, B/D, 7/1, 3/8, t/+
+2. [?] MARKERS: For every [?] you marked, make a final determination using context
+3. NUMBERS: Re-read each number digit by digit — do not guess whole numbers
+4. WORD BOUNDARIES: Check every word produces a real word or known scientific term
+
+Output ONLY the corrected transcription. If a section was correct, reproduce it unchanged.
+Do NOT add commentary, explanations, or "I corrected X" notes.
+Do NOT silently fix spelling — preserve original spelling errors.
+""".strip()
 
 FAINT_CONTENT_PROTOCOL = """
 === FAINT CONTENT PROTOCOL ===
@@ -549,17 +610,17 @@ def get_disambiguation_pairs() -> list[tuple[str, str, str]]:
 # Which rule blocks matter most for each content type.  Avoids dumping
 # ~2,500 tokens of rules that don't apply (noise hurts model attention).
 _CONTENT_TYPE_RULES: dict[str, list[str]] = {
-    "handwriting": ["fidelity", "calibration", "multipass", "disambiguation"],
-    "cursive":     ["fidelity", "calibration", "multipass", "disambiguation"],
+    "handwriting": ["fidelity", "calibration", "multipass", "anti_hallucination", "disambiguation"],
+    "cursive":     ["fidelity", "calibration", "multipass", "anti_hallucination", "disambiguation"],
     "structured":  ["fidelity", "multipass", "numbers", "tables"],
-    "printed":     ["fidelity", "multipass"],
+    "printed":     ["fidelity", "multipass", "anti_hallucination"],
     "layout":      ["fidelity", "multipass", "tables", "scientific"],
     "scientific":  ["fidelity", "multipass", "numbers", "scientific", "disambiguation"],
     "data_table":  ["fidelity", "numbers", "tables"],
-    "single_letter": ["fidelity", "calibration", "single_letter", "disambiguation"],
-    "default":     ["fidelity", "calibration", "multipass", "numbers", "disambiguation"],
+    "single_letter": ["fidelity", "calibration", "single_letter", "anti_hallucination", "disambiguation"],
+    "default":     ["fidelity", "calibration", "multipass", "numbers", "anti_hallucination", "disambiguation"],
     "full":        ["fidelity", "calibration", "multipass", "numbers",
-                    "disambiguation", "scientific", "tables", "single_letter"],
+                    "anti_hallucination", "disambiguation", "scientific", "tables", "single_letter"],
 }
 
 _RULE_BLOCKS = {
@@ -572,6 +633,7 @@ _RULE_BLOCKS = {
     "tables":        lambda: TABLE_DETECTION,
     "single_letter": lambda: SINGLE_LETTER_PROTOCOL,
     "faint":         lambda: FAINT_CONTENT_PROTOCOL,
+    "anti_hallucination": lambda: ANTI_HALLUCINATION_PROTOCOL,
 }
 
 

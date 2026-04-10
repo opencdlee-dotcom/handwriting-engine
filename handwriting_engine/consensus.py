@@ -45,6 +45,18 @@ PROVIDER_WEIGHTS = {
 # Cascade order: cheapest first (~$0.0005/img → ~$0.003 → ~$0.005)
 CASCADE_ORDER = ["gemini", "openai", "claude"]
 
+# Uncertainty marker pattern — must be defined here (before _self_correct and confidence helpers)
+_UNCERTAINTY_RE = re.compile(
+    r"\[\?\]|\?\?\?|\[illegible[^\]]*\]|\[unclear\]|unable to read",
+    re.IGNORECASE,
+)
+
+
+def _count_uncertainty_markers(text: str) -> int:
+    """Count [?] and similar uncertainty markers in transcription output."""
+    return len(_UNCERTAINTY_RE.findall(text))
+
+
 # Single-provider confidence cap — one opinion can never be "certain"
 _SINGLE_PROVIDER_MAX_CONFIDENCE = 0.70
 
@@ -59,6 +71,10 @@ def read_with_consensus(
     confidence_threshold: float = 0.8,
     content_type: str = "default",
     max_tokens: int = 4096,
+    max_debate_rounds: int = 2,
+    quality_assessment: dict | None = None,
+    max_self_correct_rounds: int = 1,
+    uncertainty_threshold: int = 3,
 ) -> ConsensusResult:
     """
     Read an image using multiple models and combine results.
@@ -67,17 +83,35 @@ def read_with_consensus(
     - vote: Send to all providers, character-level majority wins
     - best_of: Route to single best provider for content type (free, no extra cost)
     - debate: Model A reads, Model B critiques, Model A/C resolves
+    - cascade: Cheapest-first, stops when confident
+    - smart: Adaptive routing — single provider for easy images, escalating for hard
+    - self_correct: Single provider reads, then reviews and corrects its own output
+
+    Args:
+        max_debate_rounds: Maximum resolution passes for debate strategy (default 2).
+                          Set to 3 for Iterative Consensus Ensemble (ICE) — adds a
+                          third pass when uncertainty markers remain after resolution.
+        quality_assessment: Pre-computed assess_image() dict for smart routing.
+        max_self_correct_rounds: Correction passes for self_correct strategy (default 1, max 3).
+        uncertainty_threshold: [?] marker count that triggers auto-escalation in smart strategy.
     """
     if strategy == "best_of":
         return _best_of(image_b64, media_type, prompt, system_prompt, content_type, max_tokens)
     elif strategy == "vote":
         return _vote(image_b64, media_type, prompt, system_prompt, providers, confidence_threshold, content_type, max_tokens)
     elif strategy == "debate":
-        return _debate(image_b64, media_type, prompt, system_prompt, providers, max_tokens)
+        return _debate(image_b64, media_type, prompt, system_prompt, providers, max_tokens, max_debate_rounds)
     elif strategy == "cascade":
         return _cascade(image_b64, media_type, prompt, system_prompt, confidence_threshold, max_tokens)
+    elif strategy == "self_correct":
+        return _self_correct(image_b64, media_type, prompt, system_prompt, content_type, max_tokens, max_self_correct_rounds)
+    elif strategy == "smart":
+        if quality_assessment is None:
+            # No quality data — fall back to vote
+            return _vote(image_b64, media_type, prompt, system_prompt, providers, confidence_threshold, content_type, max_tokens)
+        return _smart_route(image_b64, media_type, prompt, system_prompt, quality_assessment, content_type, max_tokens, uncertainty_threshold)
     else:
-        raise ValueError(f"Unknown strategy: {strategy}. Use: vote, best_of, debate, cascade")
+        raise ValueError(f"Unknown strategy: {strategy}. Use: vote, best_of, debate, cascade, smart, self_correct")
 
 
 def _best_of(
@@ -134,6 +168,92 @@ def _best_of(
     )
 
 
+def _self_correct(
+    image_b64: str, media_type: str, prompt: str, system_prompt: str,
+    content_type: str, max_tokens: int,
+    max_rounds: int = 1,
+) -> ConsensusResult:
+    """Two-pass self-correction: read → review own output → correct.
+
+    Based on Journal of Documentation 2025 (peer-reviewed): GPT-4o
+    self-correction drops CER from 1.75% to 1.39% on IAM (~20% reduction).
+    Same model reads, then reviews its own transcription against the image.
+
+    Args:
+        max_rounds: Number of correction passes (default 1, max 3).
+                   Extra passes only trigger if [?] markers remain.
+    """
+    from handwriting_engine.handwriting import SELF_CORRECTION_PROMPT
+
+    max_rounds = min(max(1, max_rounds), 3)
+
+    provider_name = BEST_PROVIDER_ROUTING.get(content_type, BEST_PROVIDER_ROUTING["default"])
+    avail = available_providers()
+    if not avail:
+        raise ValueError(
+            "No vision providers available. Install at least one: "
+            "pip install handwriting-engine[all]"
+        )
+    if provider_name not in avail:
+        provider_name = avail[0]
+
+    if circuit_breaker.is_open(provider_name):
+        # Fall back to best_of if primary provider circuit is open
+        return _best_of(image_b64, media_type, prompt, system_prompt, content_type, max_tokens)
+
+    try:
+        provider = get_provider(provider_name)
+        initial_text = provider.read_image(image_b64, media_type, prompt, system_prompt, max_tokens)
+        circuit_breaker.record_success(provider_name)
+    except Exception as e:
+        logger.warning(f"self_correct: initial read failed for {provider_name}: {e}")
+        circuit_breaker.record_failure(provider_name)
+        return ConsensusResult(text="", confidence=0.0, strategy_used="self_correct_failed")
+
+    if not initial_text.strip():
+        return ConsensusResult(text="", confidence=0.0, strategy_used="self_correct_failed")
+
+    corrected_text = initial_text
+    rounds_done = 0
+
+    for round_num in range(max_rounds):
+        # Build the correction prompt with the current transcription
+        correction_prompt = SELF_CORRECTION_PROMPT.format(
+            initial_transcription=corrected_text
+        )
+
+        try:
+            corrected_text = provider.read_image(
+                image_b64, media_type, correction_prompt, system_prompt, max_tokens
+            )
+            rounds_done += 1
+            circuit_breaker.record_success(provider_name)
+        except Exception as e:
+            logger.warning(f"self_correct: correction pass {round_num + 1} failed: {e}")
+            break
+
+        # Stop early if no uncertainty markers remain
+        if _count_uncertainty_markers(corrected_text) == 0:
+            break
+
+    if not corrected_text.strip():
+        corrected_text = initial_text
+
+    confidence = _single_text_confidence(corrected_text)
+
+    return ConsensusResult(
+        text=corrected_text,
+        confidence=confidence,
+        confidence_level=_derive_confidence_level(confidence, corrected_text),
+        provider_results={
+            "initial": initial_text,
+            "corrected": corrected_text,
+        },
+        strategy_used=f"self_correct_{rounds_done}pass",
+        tokens_used=provider.usage,
+    )
+
+
 def _vote(
     image_b64: str, media_type: str, prompt: str, system_prompt: str,
     providers: list[str] | None, confidence_threshold: float,
@@ -171,31 +291,33 @@ def _vote(
         )
 
     import concurrent.futures
-    from handwriting_engine._constants import API_TIMEOUT_SECONDS
 
     def _read_from_provider(name):
         if circuit_breaker.is_open(name):
             logger.warning(f"Circuit breaker open for {name}, skipping")
-            return name, "", {}
+            return name, "", {}, None
         try:
             p = get_provider(name)
             text = p.read_image(image_b64, media_type, prompt, system_prompt, max_tokens)
             circuit_breaker.record_success(name)
-            return name, text, p.usage
+            return name, text, p.usage, p
         except Exception as e:
             logger.warning(f"Provider {name} failed: {e}")
             circuit_breaker.record_failure(name)
-            return name, "", {}
+            return name, "", {}, None
 
     results = {}
     total_tokens = {}
+    provider_objects = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(providers)) as pool:
         futures = {pool.submit(_read_from_provider, name): name for name in providers}
         for future in concurrent.futures.as_completed(futures):
-            name, text, usage = future.result()
+            name, text, usage, provider_obj = future.result()
             results[name] = text
             if usage:
                 total_tokens[name] = usage
+            if provider_obj:
+                provider_objects[name] = provider_obj
 
     provider_names = [name for name, v in results.items() if v]
     texts = [results[name] for name in provider_names]
@@ -212,9 +334,28 @@ def _vote(
             tokens_used=total_tokens,
         )
 
-    # Outlier detection: exclude providers with <30% agreement with ALL others
-    excluded = []
+    # Hallucination rejection: with 3+ providers, zero-weight any provider whose
+    # best agreement with ANY other provider is below 60%. This catches outputs
+    # that are wildly different from all others (hallucinated text).
+    # Does not exclude — zero-weights so the output still appears in provider_results.
+    hallucination_flagged = set()
     if len(texts) >= 3:
+        for i, name in enumerate(provider_names):
+            max_agreement = max(
+                _word_agreement_ratio(texts[i], texts[j])
+                for j in range(len(texts)) if j != i
+            )
+            if max_agreement < 0.60:
+                hallucination_flagged.add(name)
+                logger.warning(f"Vote: {name} flagged as potential hallucination "
+                               f"(max agreement {max_agreement:.2f} < 0.60)")
+
+    # Outlier detection: exclude providers with <20% agreement with ALL others.
+    # Only with 4+ providers — with exactly 3, excluding one removes tiebreaking.
+    # Threshold lowered from 30% to 20%: at 30%, legitimate minority readings
+    # get caught when 2 providers agree on wrong text.
+    excluded = []
+    if len(texts) >= 4:
         filtered_names = []
         filtered_texts = []
         for i, name in enumerate(provider_names):
@@ -222,19 +363,45 @@ def _vote(
             for j, other_name in enumerate(provider_names):
                 if i != j:
                     agreements.append(_word_agreement_ratio(texts[i], texts[j]))
-            if all(a < 0.30 for a in agreements):
-                excluded.append(f"'{name}' excluded as outlier (agreement < 30% with all others)")
+            if all(a < 0.20 for a in agreements):
+                excluded.append(f"'{name}' excluded as outlier (agreement < 20% with all others)")
                 logger.warning(f"Vote: excluding {name} as outlier")
             else:
                 filtered_names.append(name)
                 filtered_texts.append(texts[i])
 
-        if filtered_texts and len(filtered_texts) < len(texts):
+        # Safety net: never reduce below 2 providers
+        if len(filtered_texts) >= 2 and len(filtered_texts) < len(texts):
             provider_names = filtered_names
             texts = filtered_texts
 
-    weights = PROVIDER_WEIGHTS.get(content_type, PROVIDER_WEIGHTS["default"])
-    provider_weights = [(provider_names[i], weights.get(provider_names[i], 1.0)) for i in range(len(texts))]
+    # Confidence-weighted voting: combine static provider weights with
+    # per-read quality signals. A provider that returns many [?] markers
+    # or very short output gets its weight reduced for this specific vote.
+    # Hallucination-flagged providers get zero weight (effectively excluded from vote).
+    static_weights = PROVIDER_WEIGHTS.get(content_type, PROVIDER_WEIGHTS["default"])
+    provider_weights = []
+    for i, name in enumerate(provider_names):
+        if name in hallucination_flagged:
+            provider_weights.append((name, 0.0))
+            excluded.append(f"'{name}' zero-weighted: potential hallucination (agreement < 60%)")
+            continue
+        base_weight = static_weights.get(name, 1.0)
+        # Prefer real logprob confidence when available (0.0-1.0 scale),
+        # fall back to heuristic marker-counting confidence (0.0-0.7 scale)
+        p_obj = provider_objects.get(name)
+        try:
+            logprob_conf = p_obj.get_mean_confidence() if p_obj and hasattr(p_obj, 'get_mean_confidence') else 0.0
+        except (TypeError, AttributeError):
+            logprob_conf = 0.0
+        if isinstance(logprob_conf, (int, float)) and logprob_conf > 0:
+            read_confidence = logprob_conf
+            confidence_scale = 0.4 + read_confidence * 0.6
+        else:
+            read_confidence = _single_text_confidence(texts[i])
+            # Scale: confidence 0.7 (max) -> 1.0x, confidence 0.3 -> 0.6x
+            confidence_scale = 0.4 + (read_confidence / _SINGLE_PROVIDER_MAX_CONFIDENCE) * 0.6
+        provider_weights.append((name, base_weight * confidence_scale))
 
     best_text, disagreements, confidence = _word_level_vote(
         texts, provider_weights,
@@ -257,6 +424,7 @@ def _vote(
 def _debate(
     image_b64: str, media_type: str, prompt: str, system_prompt: str,
     providers: list[str] | None, max_tokens: int,
+    max_rounds: int = 2,
 ) -> ConsensusResult:
     """Two-pass propose / independent-read / word-diff / resolve debate.
 
@@ -277,55 +445,65 @@ def _debate(
             "pip install handwriting-engine[all]"
         )
 
-    # Phase 1: Propose — try preferred proposer, fall back to others
-    initial_read = ""
-    proposer = None
-    proposer_name = None
-    for candidate in providers:
+    if len(providers) < 2:
+        # Single provider — no debate possible
+        candidate = providers[0]
         if circuit_breaker.is_open(candidate):
-            logger.warning(f"debate: circuit breaker open for {candidate}, skipping")
-            continue
+            return ConsensusResult(text="", confidence=0.0, strategy_used="debate_failed")
         try:
             proposer = get_provider(candidate)
             initial_read = proposer.read_image(image_b64, media_type, prompt, system_prompt, max_tokens)
-            proposer_name = candidate
             circuit_breaker.record_success(candidate)
-            break
+            conf = _single_text_confidence(initial_read)
+            return ConsensusResult(
+                text=initial_read,
+                confidence=conf,
+                confidence_level=_derive_confidence_level(conf, initial_read),
+                provider_results={candidate: initial_read},
+                strategy_used="debate_single_fallback",
+            )
         except Exception as e:
-            logger.warning(f"debate: proposer {candidate} failed: {e}")
+            logger.warning(f"debate: {candidate} failed: {e}")
             circuit_breaker.record_failure(candidate)
+            return ConsensusResult(text="", confidence=0.0, strategy_used="debate_failed")
+
+    # Phase 1 & 2: Run proposer and critic reads in parallel (independent)
+    import concurrent.futures
+
+    def _debate_read(candidate):
+        if circuit_breaker.is_open(candidate):
+            logger.warning(f"debate: circuit breaker open for {candidate}, skipping")
+            return candidate, "", None
+        try:
+            p = get_provider(candidate)
+            text = p.read_image(image_b64, media_type, prompt, system_prompt, max_tokens)
+            circuit_breaker.record_success(candidate)
+            return candidate, text, p
+        except Exception as e:
+            logger.warning(f"debate: {candidate} failed: {e}")
+            circuit_breaker.record_failure(candidate)
+            return candidate, "", None
+
+    proposer_name, proposer, initial_read = None, None, ""
+    critic_name, critic, independent_read = None, None, ""
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(providers)) as pool:
+        futures = {pool.submit(_debate_read, name): name for name in providers}
+        results_list = []
+        for future in concurrent.futures.as_completed(futures):
+            name, text, provider_obj = future.result()
+            if text:
+                results_list.append((name, text, provider_obj))
+
+    # Assign first two successful reads as proposer and critic
+    if len(results_list) >= 2:
+        proposer_name, initial_read, proposer = results_list[0]
+        critic_name, independent_read, critic = results_list[1]
+    elif len(results_list) == 1:
+        proposer_name, initial_read, proposer = results_list[0]
 
     if not initial_read:
         return ConsensusResult(text="", confidence=0.0, strategy_used="debate_failed")
-
-    if len(providers) < 2:
-        conf = _single_text_confidence(initial_read)
-        return ConsensusResult(
-            text=initial_read,
-            confidence=conf,
-            confidence_level=_derive_confidence_level(conf, initial_read),
-            provider_results={proposer_name: initial_read},
-            strategy_used="debate_single_fallback",
-        )
-
-    # Phase 2: Independent read — try critic candidates (skip proposer used)
-    independent_read = ""
-    critic = None
-    critic_name = None
-    critic_candidates = [p for p in providers if p != proposer_name]
-    for candidate in critic_candidates:
-        if circuit_breaker.is_open(candidate):
-            logger.warning(f"debate: circuit breaker open for {candidate}, skipping")
-            continue
-        try:
-            critic = get_provider(candidate)
-            independent_read = critic.read_image(image_b64, media_type, prompt, system_prompt, max_tokens)
-            critic_name = candidate
-            circuit_breaker.record_success(candidate)
-            break
-        except Exception as e:
-            logger.warning(f"debate: critic {candidate} failed: {e}")
-            circuit_breaker.record_failure(candidate)
 
     if not independent_read:
         # Only proposer succeeded — return single-provider result
@@ -354,27 +532,82 @@ def _debate(
                 critic_name: independent_read,
             },
             strategy_used="debate_agreed",
-            tokens_used={**proposer.usage, **critic.usage},
+            tokens_used={
+                key: proposer.usage.get(key, 0) + critic.usage.get(key, 0)
+                for key in set(list(proposer.usage.keys()) + list(critic.usage.keys()))
+            },
         )
 
-    # Phase 4: Targeted resolution — critic re-reads ONLY disputed words
+    # Phase 4: Targeted resolution — a DIFFERENT model verifies disputed words.
+    # Research: LLMs cannot reliably self-correct OCR. Cross-model resolution
+    # gives a fresh perspective on ambiguous characters.
     diff_summary = "\n".join(
-        f"- Position {d['pos']}: Provider A read \"{d['word_a']}\" vs Provider B read \"{d['word_b']}\""
-        for d in word_diffs[:30]
+        f"- Area {i+1}: \"{d['word_a']}\" or \"{d['word_b']}\"?"
+        for i, d in enumerate(word_diffs[:30])
     )
     resolve_prompt = (
-        f"Two AI models read this handwritten image independently. "
-        f"They agreed on most text but disagreed on these specific words:\n\n"
+        f"Two preliminary readings of this handwritten image identified areas "
+        f"that need careful verification. They agreed on most text but these "
+        f"specific words need your attention:\n\n"
         f"{diff_summary}\n\n"
-        f"Look at the image carefully and for EACH disagreement above, "
-        f"state which reading is correct (or provide a third reading if both are wrong). "
-        f"Then produce the complete final text with all disagreements resolved. "
+        f"Please look carefully at each flagged area in the image and report "
+        f"what you actually see written. Base your reading on the image only — "
+        f"the preliminary readings are provided as areas to pay extra attention to, "
+        f"not as options to choose between.\n"
+        f"Then produce the complete final text with all areas resolved. "
         f"Mark any word you are still uncertain about with [?]. "
         f"Preserve original spelling exactly as written."
     )
-    final = critic.read_image(image_b64, media_type, resolve_prompt, system_prompt, max_tokens)
 
-    # Confidence: base is agreement ratio, boosted slightly by resolution pass
+    # Select resolver: prefer a third provider, fall back to proposer (fresh perspective
+    # since it hasn't seen the critic's output or the disagreement summary before)
+    resolver_name = proposer_name
+    resolver = proposer
+    avail = available_providers()
+    for candidate in avail:
+        if candidate != proposer_name and candidate != critic_name and not circuit_breaker.is_open(candidate):
+            try:
+                resolver = get_provider(candidate)
+                resolver_name = candidate
+                break
+            except Exception:
+                continue
+
+    final = resolver.read_image(image_b64, media_type, resolve_prompt, system_prompt, max_tokens)
+    used_providers = {proposer_name, critic_name, resolver_name}
+    strategy_used = "debate_resolved"
+
+    # Phase 5 (ICE): Optional third resolution pass when uncertainty markers remain.
+    # Only triggers when max_rounds >= 3, [?] markers exist, and a fresh provider is available.
+    if max_rounds >= 3 and _UNCERTAINTY_RE.search(final):
+        avail = available_providers()
+        ice_candidates = [c for c in avail if c not in used_providers and not circuit_breaker.is_open(c)]
+        if ice_candidates:
+            remaining_markers = _UNCERTAINTY_RE.findall(final)
+            ice_prompt = (
+                f"A previous multi-model reading of this handwritten image still has "
+                f"{len(remaining_markers)} uncertain area(s). The current best reading is:\n\n"
+                f"\"{final}\"\n\n"
+                f"Please look at the image carefully and resolve each [?], [illegible], "
+                f"or ??? marker. Produce the complete final text. "
+                f"Mark any word you are still uncertain about with [?]. "
+                f"Preserve original spelling exactly as written."
+            )
+            try:
+                ice_provider = get_provider(ice_candidates[0])
+                ice_result = ice_provider.read_image(image_b64, media_type, ice_prompt, system_prompt, max_tokens)
+                if ice_result.strip():
+                    # Only accept if it reduced uncertainty markers
+                    new_markers = len(_UNCERTAINTY_RE.findall(ice_result))
+                    if new_markers < len(remaining_markers):
+                        final = ice_result
+                        used_providers.add(ice_candidates[0])
+                        strategy_used = "debate_ice_resolved"
+                        logger.info(f"ICE pass reduced markers from {len(remaining_markers)} to {new_markers}")
+            except Exception as e:
+                logger.warning(f"debate ICE pass failed: {e}")
+
+    # Confidence: base is agreement ratio, boosted slightly by resolution pass(es)
     resolution_boost = min(0.1, (1.0 - agreement_ratio) * 0.5)
     confidence = min(0.92, agreement_ratio + resolution_boost)
 
@@ -389,11 +622,14 @@ def _debate(
         provider_results={
             proposer_name: initial_read,
             critic_name: independent_read,
-            f"{critic_name}_resolved": final,
+            f"{resolver_name}_resolved": final,
         },
         disagreements=disagreement_strs,
-        strategy_used="debate_resolved",
-        tokens_used={**proposer.usage, **critic.usage},
+        strategy_used=strategy_used,
+        tokens_used={
+            key: proposer.usage.get(key, 0) + critic.usage.get(key, 0)
+            for key in set(list(proposer.usage.keys()) + list(critic.usage.keys()))
+        },
     )
 
 
@@ -495,14 +731,57 @@ def _cascade(
     return ConsensusResult(text="", confidence=0.0, provider_results=all_results, strategy_used="cascade_failed")
 
 
+def _smart_route(
+    image_b64: str, media_type: str, prompt: str, system_prompt: str,
+    quality_assessment: dict, content_type: str, max_tokens: int,
+) -> ConsensusResult:
+    """Adaptive routing based on image quality — spend API calls where they matter.
+
+    Easy (sharp, high contrast): Single Gemini read — cheapest, best CER.
+    Medium (fair quality, one issue): Gemini + cross-validator.
+    Hard (poor, faint, multiple issues): Full vote with all providers.
+    """
+    from handwriting_engine._constants import (
+        SMART_ROUTE_EASY_BLUR, SMART_ROUTE_EASY_CONTRAST,
+        SMART_ROUTE_HARD_BLUR, SMART_ROUTE_HARD_CONTRAST,
+    )
+
+    quality = quality_assessment.get("quality", "fair")
+    blur = quality_assessment.get("blur_score", 100)
+    contrast = quality_assessment.get("contrast_score", 0.4)
+    faint = quality_assessment.get("faint_ink", False)
+    issues = quality_assessment.get("issues", [])
+
+    # Classify difficulty
+    if quality == "good" and blur >= SMART_ROUTE_EASY_BLUR and contrast >= SMART_ROUTE_EASY_CONTRAST:
+        difficulty = "easy"
+    elif quality == "poor" or faint or len(issues) >= 2 or blur < SMART_ROUTE_HARD_BLUR or contrast < SMART_ROUTE_HARD_CONTRAST:
+        difficulty = "hard"
+    else:
+        difficulty = "medium"
+
+    logger.info(f"Smart route: difficulty={difficulty} (quality={quality}, blur={blur}, contrast={contrast})")
+
+    avail = available_providers()
+    if not avail:
+        raise ValueError("No vision providers available.")
+
+    if difficulty == "easy":
+        # Single best provider (Gemini) — cheapest and best CER
+        return _best_of(image_b64, media_type, prompt, system_prompt, content_type, max_tokens)
+
+    elif difficulty == "medium":
+        # Gemini + one cross-validator via cascade
+        return _cascade(image_b64, media_type, prompt, system_prompt, 0.7, max_tokens)
+
+    else:
+        # Hard: full vote with all available providers
+        return _vote(image_b64, media_type, prompt, system_prompt, None, 0.8, content_type, max_tokens)
+
+
 # ---------------------------------------------------------------------------
 # Confidence scoring — derived from actual signals, not vibes
 # ---------------------------------------------------------------------------
-
-_UNCERTAINTY_RE = re.compile(
-    r"\[\?\]|\?\?\?|\[illegible[^\]]*\]|\[unclear\]|unable to read",
-    re.IGNORECASE,
-)
 
 
 def _derive_confidence_level(confidence: float, text: str) -> str:
@@ -525,6 +804,11 @@ def _derive_confidence_level(confidence: float, text: str) -> str:
     if len(words) < 5 and not text.strip().startswith("["):
         return "LOW"
 
+    # Single-character answers: always LOW without cross-validation
+    stripped = text.strip()
+    if len(stripped) <= 2 and stripped.isalpha():
+        return "LOW"
+
     # High marker ratio = LOW
     if words and marker_count / len(words) > 0.1:
         return "LOW"
@@ -542,6 +826,10 @@ def _single_text_confidence(text: str) -> float:
     Capped at _SINGLE_PROVIDER_MAX_CONFIDENCE because one opinion can't
     be certain. Reduced by uncertainty markers — each [?] is a real flag,
     not a minor penalty.
+
+    Short, specific text (names, single words) gets an extra penalty:
+    high specificity from a single provider without cross-validation is
+    the hallucination pattern ("Sheldon" → "Steffon Espericueta").
     """
     if not text or not text.strip():
         return 0.0
@@ -559,6 +847,18 @@ def _single_text_confidence(text: str) -> float:
     # Penalize very short output (< 3 words) — suspicious for page reads
     if len(words) < 3:
         score -= 0.15
+
+    # Short text with NO uncertainty markers is the hallucination pattern:
+    # model confidently produces specific text from ambiguous input.
+    # 1-5 words with zero [?] flags and no illegible markers = overconfident.
+    if len(words) <= 5 and marker_count == 0:
+        score -= 0.10
+
+    # Single-character answers: cap even lower — one character can never
+    # have enough visual evidence for moderate confidence without cross-validation
+    stripped = text.strip()
+    if len(stripped) <= 2 and stripped.isalpha():
+        score = min(score, 0.45)
 
     # Penalize highly repetitive text
     unique_words = len(set(w.lower() for w in words))
@@ -753,3 +1053,47 @@ def _word_level_vote(
     confidence = min(0.95, confidence)
 
     return final_text, disagreements[:20], confidence
+
+
+# ---------------------------------------------------------------------------
+# Cost estimation
+# ---------------------------------------------------------------------------
+
+def estimate_strategy_cost(
+    strategy: str,
+    providers: list[str] | None = None,
+    image_count: int = 1,
+    avg_input_tokens: int = 2000,
+    avg_output_tokens: int = 1000,
+) -> dict:
+    """Estimate USD cost for a consensus strategy before running.
+
+    Returns dict with per-provider costs and total.
+    """
+    from handwriting_engine._constants import COST_PER_1M_TOKENS
+
+    if providers is None:
+        providers = available_providers()
+
+    # How many provider calls per image for each strategy
+    calls_per_image = {
+        "best_of": 1,
+        "vote": len(providers),
+        "debate": 3,  # 2 independent reads + 1 resolution
+        "cascade": 1.5,  # Average: sometimes 1, sometimes 2-3
+    }
+
+    num_calls = calls_per_image.get(strategy, len(providers))
+
+    costs = {}
+    for p in providers:
+        rates = COST_PER_1M_TOKENS.get(p, {"input": 3.0, "output": 15.0})
+        per_call = (
+            (avg_input_tokens / 1_000_000) * rates["input"]
+            + (avg_output_tokens / 1_000_000) * rates["output"]
+        )
+        provider_calls = num_calls if strategy == "vote" else (num_calls / len(providers) if providers else 0)
+        costs[p] = round(per_call * provider_calls * image_count, 4)
+
+    total = sum(costs.values())
+    return {"per_provider": costs, "total": round(total, 4), "strategy": strategy, "image_count": image_count}
