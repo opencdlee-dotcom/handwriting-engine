@@ -216,6 +216,7 @@ def run_benchmark(
     enhance_strategy: str | None = None,
     iam_partition: str | None = None,
     vocabulary_hints: list[str] | None = None,
+    vocab_hints_off: int = 0,
 ) -> int:
     """Execute a full benchmark run.
 
@@ -250,6 +251,7 @@ def run_benchmark(
             on_progress, mode, auto_enhance, inject_lessons, enhance_strategy,
             iam_partition=iam_partition,
             vocabulary_hints=vocabulary_hints,
+            vocab_hints_off=vocab_hints_off,
         )
     finally:
         conn.close()
@@ -269,6 +271,7 @@ def _run_benchmark_inner(
     enhance_strategy: str | None = None,
     iam_partition: str | None = None,
     vocabulary_hints: list[str] | None = None,
+    vocab_hints_off: int = 0,
 ) -> int:
     """Inner benchmark logic with connection managed by caller."""
     # Resolve providers
@@ -299,7 +302,6 @@ def _run_benchmark_inner(
 
     # Create run with provenance metadata
     all_strategies = ["single"] + strategies
-    vocab_hints_off = 0 if vocabulary_hints else 0  # Phase 6: always 0; capture point for future --vocab-hints-off flag
     run_id = insert_run(
         conn,
         label=label,
