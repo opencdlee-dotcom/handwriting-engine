@@ -401,16 +401,21 @@ def finish_run(
 def list_runs(conn: sqlite3.Connection) -> list[RunSummary]:
     """Return all runs (without detailed results)."""
     rows = conn.execute("SELECT * FROM runs ORDER BY id DESC").fetchall()
-    return [
-        RunSummary(
+    results = []
+    for r in rows:
+        keys = r.keys()
+        results.append(RunSummary(
             run_id=r["id"],
             label=r["label"],
             started_at=r["started_at"],
             finished_at=r["finished_at"] or "",
             sample_count=r["sample_count"],
-        )
-        for r in rows
-    ]
+            model_version=r["model_version"] if "model_version" in keys else None,
+            iam_partition=r["iam_partition"] if "iam_partition" in keys else None,
+            norm_flags=r["norm_flags"] if "norm_flags" in keys else None,
+            vocab_hints_off=r["vocab_hints_off"] if "vocab_hints_off" in keys else 0,
+        ))
+    return results
 
 
 # --- Provider Outputs ---
