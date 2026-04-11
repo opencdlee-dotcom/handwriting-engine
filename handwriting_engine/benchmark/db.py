@@ -20,7 +20,7 @@ from handwriting_engine.benchmark.models import (
 )
 
 DEFAULT_DB_PATH = Path.home() / ".handwriting-engine" / "benchmark.db"
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 
 logger = logging.getLogger(__name__)
 
@@ -61,30 +61,35 @@ CREATE TABLE IF NOT EXISTS quality_assessments (
 );
 
 CREATE TABLE IF NOT EXISTS runs (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    label        TEXT DEFAULT '',
-    providers    TEXT NOT NULL DEFAULT '[]',
-    strategies   TEXT NOT NULL DEFAULT '[]',
-    domain       TEXT DEFAULT 'biology',
-    started_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    finished_at  TEXT,
-    sample_count INTEGER DEFAULT 0,
-    notes        TEXT DEFAULT ''
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    label            TEXT DEFAULT '',
+    providers        TEXT NOT NULL DEFAULT '[]',
+    strategies       TEXT NOT NULL DEFAULT '[]',
+    domain           TEXT DEFAULT 'biology',
+    started_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    finished_at      TEXT,
+    sample_count     INTEGER DEFAULT 0,
+    notes            TEXT DEFAULT '',
+    model_version    TEXT DEFAULT NULL,
+    iam_partition    TEXT DEFAULT NULL,
+    norm_flags       TEXT DEFAULT NULL,
+    vocab_hints_off  INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS provider_outputs (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id        INTEGER NOT NULL REFERENCES runs(id),
-    sample_id     INTEGER NOT NULL REFERENCES samples(id),
-    provider      TEXT NOT NULL,
-    strategy      TEXT NOT NULL DEFAULT 'single',
-    output_text   TEXT NOT NULL,
-    confidence    REAL DEFAULT 0.0,
-    latency_ms    INTEGER DEFAULT 0,
-    input_tokens  INTEGER DEFAULT 0,
-    output_tokens INTEGER DEFAULT 0,
-    error         TEXT,
-    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id               INTEGER NOT NULL REFERENCES runs(id),
+    sample_id            INTEGER NOT NULL REFERENCES samples(id),
+    provider             TEXT NOT NULL,
+    strategy             TEXT NOT NULL DEFAULT 'single',
+    output_text          TEXT NOT NULL,
+    confidence           REAL DEFAULT 0.0,
+    latency_ms           INTEGER DEFAULT 0,
+    input_tokens         INTEGER DEFAULT 0,
+    output_tokens        INTEGER DEFAULT 0,
+    error                TEXT,
+    created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    question_marker_rate REAL DEFAULT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_po_run ON provider_outputs(run_id);
 CREATE INDEX IF NOT EXISTS idx_po_sample ON provider_outputs(sample_id);
@@ -122,6 +127,15 @@ _MIGRATIONS: dict[int, str] = {
     3: """
         ALTER TABLE runs ADD COLUMN total_cost_usd REAL DEFAULT 0.0;
         UPDATE schema_version SET version = 3;
+    """,
+    # v4: Add provenance columns to runs + marker rate to provider_outputs
+    4: """
+        ALTER TABLE runs ADD COLUMN model_version TEXT DEFAULT NULL;
+        ALTER TABLE runs ADD COLUMN iam_partition TEXT DEFAULT NULL;
+        ALTER TABLE runs ADD COLUMN norm_flags TEXT DEFAULT NULL;
+        ALTER TABLE runs ADD COLUMN vocab_hints_off INTEGER DEFAULT 0;
+        ALTER TABLE provider_outputs ADD COLUMN question_marker_rate REAL DEFAULT NULL;
+        UPDATE schema_version SET version = 4;
     """,
 }
 
@@ -355,12 +369,18 @@ def insert_run(
     providers: list[str] | None = None,
     strategies: list[str] | None = None,
     domain: str = "biology",
+    model_version: str | None = None,
+    iam_partition: str | None = None,
+    norm_flags: str | None = None,
+    vocab_hints_off: int = 0,
 ) -> int:
     """Create a new benchmark run. Returns its ID."""
     cur = conn.execute(
-        """INSERT INTO runs (label, providers, strategies, domain)
-           VALUES (?, ?, ?, ?)""",
-        (label, json.dumps(providers or []), json.dumps(strategies or []), domain),
+        """INSERT INTO runs (label, providers, strategies, domain,
+                             model_version, iam_partition, norm_flags, vocab_hints_off)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (label, json.dumps(providers or []), json.dumps(strategies or []), domain,
+         model_version, iam_partition, norm_flags, vocab_hints_off),
     )
     conn.commit()
     return cur.lastrowid
@@ -408,17 +428,18 @@ def insert_provider_output(
     input_tokens: int = 0,
     output_tokens: int = 0,
     error: str | None = None,
+    question_marker_rate: float | None = None,
     autocommit: bool = True,
 ) -> int:
     """Store a provider output. Returns its ID."""
     cur = conn.execute(
         """INSERT INTO provider_outputs
                (run_id, sample_id, provider, strategy, output_text, confidence,
-                latency_ms, input_tokens, output_tokens, error)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                latency_ms, input_tokens, output_tokens, error, question_marker_rate)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             run_id, sample_id, provider, strategy, output_text, confidence,
-            latency_ms, input_tokens, output_tokens, error,
+            latency_ms, input_tokens, output_tokens, error, question_marker_rate,
         ),
     )
     if autocommit:
