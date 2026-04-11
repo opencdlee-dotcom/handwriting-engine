@@ -28,6 +28,22 @@ logger = logging.getLogger(__name__)
 from handwriting_engine._constants import COST_PER_1M_TOKENS
 
 
+def _compute_marker_rate(text: str) -> float:
+    """Compute the fraction of words that are [?] uncertainty markers.
+
+    Computed from raw provider output BEFORE normalization so markers are not stripped.
+    Returns 0.0 for empty text. Returns 1.0 if all tokens are markers.
+    """
+    if not text:
+        return 0.0
+    import re
+    tokens = text.split()
+    if not tokens:
+        return 0.0
+    marker_count = sum(1 for t in tokens if re.fullmatch(r"\[\?\]", t))
+    return marker_count / len(tokens)
+
+
 def estimate_cost(input_tokens: int, output_tokens: int, provider: str) -> float:
     """Estimate USD cost from token counts.
 
@@ -280,6 +296,9 @@ def _run_benchmark_inner(
         # Single-provider reads
         for provider in providers:
             result = _read_single(sample.image_path, provider, domain, auto_enhance, inject_lessons, enhance_strategy)
+            # Compute marker rate from raw text BEFORE any normalization
+            raw_text = result["text"]
+            marker_rate = _compute_marker_rate(raw_text) if raw_text else None
             po_id = insert_provider_output(
                 conn,
                 run_id=run_id,
@@ -292,6 +311,7 @@ def _run_benchmark_inner(
                 input_tokens=result["input_tokens"],
                 output_tokens=result["output_tokens"],
                 error=result["error"],
+                question_marker_rate=marker_rate,
                 autocommit=False,
             )
 

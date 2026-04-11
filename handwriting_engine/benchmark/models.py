@@ -49,6 +49,7 @@ class ProviderOutput:
     input_tokens: int = 0
     output_tokens: int = 0
     error: str | None = None
+    question_marker_rate: float | None = None
 
 
 @dataclass
@@ -81,6 +82,7 @@ class StrategyResult:
     estimated_cost_usd: float
     sample_count: int
     failures: int = 0
+    mean_marker_rate: float = 0.0
 
 
 @dataclass
@@ -93,3 +95,7 @@ class RunSummary:
     finished_at: str = ""
     sample_count: int = 0
     results: list[StrategyResult] = field(default_factory=list)
+    model_version: str | None = None
+    iam_partition: str | None = None
+    norm_flags: str | None = None
+    vocab_hints_off: int = 0
