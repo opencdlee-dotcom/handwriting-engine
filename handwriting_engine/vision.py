@@ -215,6 +215,7 @@ def read_page(
     auto_classify: bool = False,
     vocab_priming: bool = False,
     line_level: bool = False,
+    auto_identify_writer: bool = False,
 ) -> str:
     """
     Read a single handwritten page.
@@ -279,6 +280,14 @@ def read_page(
             "For names: read letter by letter, flag the whole name with [?] if any letter is uncertain. "
             "Do NOT guess — if unsure, flag it rather than producing a confident wrong reading."
         )
+
+    # Auto-identify writer from image when no writer_id was provided
+    if writer_id is None and auto_identify_writer:
+        from handwriting_engine.writer_embeddings import identify_writer
+        detected_id, score = identify_writer(image_path)
+        if detected_id:
+            writer_id = detected_id
+            logger.debug("Auto-identified writer %s (similarity %.3f)", writer_id, score)
 
     # Reading strategies go in system prompt (enables prompt caching, better model attention)
     # Load writer profile first so it can replace the generic calibration block
@@ -536,6 +545,7 @@ def read_with_consensus(
     writer_id: str | None = None,
     vocabulary_hints: list[str] | None = None,
     auto_classify: bool = False,
+    auto_identify_writer: bool = False,
 ) -> ConsensusResult:
     """
     Read a page using multi-model consensus.
@@ -565,6 +575,14 @@ def read_with_consensus(
             "For names: read letter by letter, flag the whole name with [?] if any letter is uncertain. "
             "Do NOT guess — if unsure, flag it rather than producing a confident wrong reading."
         )
+
+    # Auto-identify writer from image when no writer_id was provided
+    if writer_id is None and auto_identify_writer:
+        from handwriting_engine.writer_embeddings import identify_writer
+        detected_id, score = identify_writer(image_path)
+        if detected_id:
+            writer_id = detected_id
+            logger.debug("Auto-identified writer %s (similarity %.3f)", writer_id, score)
 
     # Load writer profile first so it can replace the generic calibration block
     writer_profile_dict = None

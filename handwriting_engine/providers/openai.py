@@ -2,7 +2,7 @@
 OpenAI GPT vision provider — best for messy handwriting, cursive, single-letter disambiguation.
 
 Key optimizations from research:
-- detail="original" for handwriting (NOT "high" — critical for low-contrast scans)
+- detail="high" for handwriting on GPT-4.1 ("original" is GPT-5.4+ only)
 - Structured output with JSON schema for consistent formatting
 - Retry with exponential backoff on rate limits and server errors
 """
@@ -10,6 +10,7 @@ Key optimizations from research:
 from __future__ import annotations
 
 import json
+import math
 import os
 import logging
 
@@ -35,10 +36,11 @@ class OpenAIProvider:
         self._model = model or os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL)
         self._client = OpenAI(api_key=self._api_key)
         self._usage = {"input_tokens": 0, "output_tokens": 0}
+        self.token_confidences: list[float] = []
 
     def _retryable_exceptions(self) -> tuple:
-        from openai import RateLimitError, APIStatusError
-        return (RateLimitError, APIStatusError)
+        from openai import RateLimitError, APIConnectionError, InternalServerError
+        return (RateLimitError, APIConnectionError, InternalServerError)
 
     def read_image(
         self,
@@ -59,7 +61,7 @@ class OpenAIProvider:
                     "type": "image_url",
                     "image_url": {
                         "url": f"data:{media_type};base64,{image_b64}",
-                        "detail": "original",  # Critical for handwriting
+                        "detail": "high",  # "original" is GPT-5.4+ only; "high" is best for GPT-4.1
                     },
                 },
                 {"type": "text", "text": prompt},
@@ -72,10 +74,13 @@ class OpenAIProvider:
                 messages=messages,
                 max_tokens=max_tokens,
                 temperature=0,
+                logprobs=True,
+                top_logprobs=5,
             )
 
         response = retry_api_call(_call, retryable_exceptions=self._retryable_exceptions())
         self._accumulate(response)
+        self._parse_logprobs(response)
         return response.choices[0].message.content or ""
 
     def read_batch(
@@ -97,7 +102,7 @@ class OpenAIProvider:
                         "type": "image_url",
                         "image_url": {
                             "url": f"data:{media_type};base64,{data}",
-                            "detail": "original",
+                            "detail": "high",
                         },
                     })
                 elif block.get("type") == "text":
@@ -142,7 +147,7 @@ class OpenAIProvider:
                         "type": "image_url",
                         "image_url": {
                             "url": f"data:{media_type};base64,{data}",
-                            "detail": "original",
+                            "detail": "high",
                         },
                     })
                 elif block.get("type") == "text":
@@ -170,12 +175,34 @@ class OpenAIProvider:
         response = retry_api_call(_call, retryable_exceptions=self._retryable_exceptions())
         self._accumulate(response)
         text = response.choices[0].message.content or "{}"
-        return json.loads(text)
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse structured response: {e}")
+            return None
 
     def _accumulate(self, response):
         if hasattr(response, "usage") and response.usage:
             self._usage["input_tokens"] += response.usage.prompt_tokens or 0
             self._usage["output_tokens"] += response.usage.completion_tokens or 0
+
+    def _parse_logprobs(self, response):
+        """Extract per-token confidence scores from logprobs response."""
+        self.token_confidences = []
+        try:
+            logprobs = response.choices[0].logprobs
+            if logprobs and logprobs.content:
+                for token_info in logprobs.content:
+                    if token_info.logprob is not None:
+                        self.token_confidences.append(math.exp(token_info.logprob))
+        except (AttributeError, IndexError):
+            pass
+
+    def get_mean_confidence(self) -> float:
+        """Return average per-token confidence (0.0-1.0) from last read's logprobs."""
+        if not self.token_confidences:
+            return 0.0
+        return sum(self.token_confidences) / len(self.token_confidences)
 
     @property
     def usage(self) -> dict:

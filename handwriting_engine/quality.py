@@ -23,6 +23,7 @@ from handwriting_engine._constants import (
     CONTRAST_THRESHOLD,
     FAINT_INK_BRIGHTNESS,
     FAINT_INK_CONTRAST,
+    SKEW_THRESHOLD_DEGREES,
 )
 
 
@@ -120,6 +121,7 @@ def assess_image(image_path: str) -> dict:
     blur = assess_blur(img)
     contrast = assess_contrast(img)
     bright_mean, bright_std = assess_brightness(img)
+    skew_angle = detect_skew(image_path)
 
     issues: list[str] = []
     if blur < BLUR_THRESHOLD:
@@ -130,6 +132,8 @@ def assess_image(image_path: str) -> dict:
         issues.append("too_dark")
     elif bright_mean > BRIGHTNESS_HIGH:
         issues.append("too_bright")
+    if abs(skew_angle) >= SKEW_THRESHOLD_DEGREES:
+        issues.append("skewed")
 
     if not issues:
         quality = "good"
@@ -151,9 +155,14 @@ def assess_image(image_path: str) -> dict:
         strategy = "full"
 
     # Faint-ink detection: high brightness + low contrast = washed-out handwriting
+    # Must run BEFORE strategy determination so faint images get enhancement
     faint = bright_mean > FAINT_INK_BRIGHTNESS and contrast < FAINT_INK_CONTRAST
     if faint and "low_contrast" not in issues:
         issues.append("faint_ink")
+
+    # Re-evaluate strategy if faint ink was detected after initial assessment
+    if faint and strategy is None:
+        strategy = "contrast"
 
     img.close()
 
@@ -163,6 +172,7 @@ def assess_image(image_path: str) -> dict:
         "contrast_score": contrast,
         "brightness_mean": bright_mean,
         "brightness_std": bright_std,
+        "skew_angle": skew_angle,
         "issues": issues,
         "quality": quality,
         "faint_ink": faint,
@@ -184,6 +194,22 @@ def recommend_enhancement_params(assessment: dict) -> dict:
     quality = assessment.get("quality", "good")
     faint = assessment.get("faint_ink", False)
 
+    # Check faint ink before the quality=="good" early return — a faint image needs
+    # contrast enhancement even when other quality metrics look good.
+    if faint or "faint_ink" in issues:
+        return {
+            "strategy": "adaptive",
+            "denoise": False,
+            "sharpen": False,
+            "sharpen_factor": 1.0,
+            "contrast": True,
+            "contrast_factor": 2.0,
+            "autocontrast_cutoff": 3,
+            "brighten": True,
+            "preserve_color": True,
+            "reason": "faint ink — heavy contrast, no sharpen",
+        }
+
     if quality == "good":
         return {"strategy": "llm", "reason": "good quality — light touch only"}
 
@@ -199,14 +225,7 @@ def recommend_enhancement_params(assessment: dict) -> dict:
         "reason": "",
     }
 
-    if faint or "faint_ink" in issues:
-        params["contrast"] = True
-        params["contrast_factor"] = 2.0
-        params["autocontrast_cutoff"] = 3
-        params["brighten"] = True
-        # NO sharpen for faint — amplifies noise in washed-out images
-        params["reason"] = "faint ink — heavy contrast, no sharpen"
-    elif "blurry" in issues and "low_contrast" not in issues:
+    if "blurry" in issues and "low_contrast" not in issues:
         params["sharpen"] = True
         params["sharpen_factor"] = 2.5
         params["denoise"] = True
@@ -239,6 +258,143 @@ def recommend_enhancement_params(assessment: dict) -> dict:
 
     params["strategy"] = "adaptive"
     return params
+
+
+# ---------------------------------------------------------------------------
+# Skew detection
+# ---------------------------------------------------------------------------
+
+
+def detect_skew(image_path: str) -> float:
+    """Detect page rotation angle in degrees using horizontal projection profile.
+
+    Tries a range of angles (-5 to +5 degrees) and picks the one that
+    maximizes the variance of the horizontal projection profile (sharper
+    row transitions = more aligned text lines).
+
+    Returns:
+        Rotation angle in degrees (positive = clockwise). Returns 0.0 if
+        detection fails or the image appears unskewed.
+    """
+    try:
+        img = Image.open(image_path)
+        img.load()
+    except (IOError, OSError, Image.UnidentifiedImageError):
+        return 0.0
+
+    gray = img.convert("L")
+    # Downsample for speed
+    if max(gray.size) > 600:
+        ratio = 600 / max(gray.size)
+        gray = gray.resize((int(gray.width * ratio), int(gray.height * ratio)))
+
+    # Binarize: pixels below mean brightness are "ink"
+    stat = ImageStat.Stat(gray)
+    threshold = stat.mean[0] * 0.75
+    w, h = gray.size
+    best_angle = 0.0
+    best_variance = 0.0
+
+    # Test angles from -5 to +5 in 0.25 degree steps
+    for angle_tenth in range(-20, 21):
+        angle = angle_tenth * 0.25
+        rotated = gray.rotate(angle, expand=False, fillcolor=255)
+        rot_pixels = rotated.load()
+
+        # Compute horizontal projection profile (count ink pixels per row)
+        profile = []
+        for y in range(h):
+            count = 0
+            for x in range(w):
+                if rot_pixels[x, y] < threshold:
+                    count += 1
+            profile.append(count)
+
+        # Variance of the profile — higher means sharper line transitions
+        if profile:
+            mean_count = sum(profile) / len(profile)
+            variance = sum((c - mean_count) ** 2 for c in profile) / len(profile)
+            if variance > best_variance:
+                best_variance = variance
+                best_angle = angle
+
+    img.close()
+
+    # Only report skew above threshold
+    if abs(best_angle) < SKEW_THRESHOLD_DEGREES:
+        return 0.0
+
+    return best_angle
+
+
+# ---------------------------------------------------------------------------
+# Handwriting style classification
+# ---------------------------------------------------------------------------
+
+
+def classify_handwriting_style(image_path: str) -> str:
+    """Classify handwriting as print, cursive, or mixed.
+
+    Uses connected-component analysis on a binarized image:
+    - Cursive has more horizontal connectivity (wide components)
+    - Print has more isolated, narrow components
+    - Mixed is in between
+
+    Args:
+        image_path: Path to the image file.
+
+    Returns:
+        One of ``"cursive"``, ``"print"``, or ``"mixed"``.
+    """
+    try:
+        img = Image.open(image_path)
+        img.load()
+    except (IOError, OSError, Image.UnidentifiedImageError):
+        return "mixed"  # Safe default
+
+    gray = img.convert("L")
+    # Downsample for speed
+    if max(gray.size) > 600:
+        ratio = 600 / max(gray.size)
+        gray = gray.resize((int(gray.width * ratio), int(gray.height * ratio)))
+
+    w, h = gray.size
+    pixels = gray.load()
+
+    # Simple Otsu-like binarization: pixels below mean brightness are "ink"
+    stat = ImageStat.Stat(gray)
+    threshold = stat.mean[0] * 0.75  # Below 75% of mean = ink
+
+    # Measure horizontal run lengths of ink pixels
+    run_lengths = []
+    for y in range(h):
+        run = 0
+        for x in range(w):
+            if pixels[x, y] < threshold:
+                run += 1
+            elif run > 0:
+                run_lengths.append(run)
+                run = 0
+        if run > 0:
+            run_lengths.append(run)
+
+    img.close()
+
+    if not run_lengths:
+        return "mixed"
+
+    avg_run = sum(run_lengths) / len(run_lengths)
+    long_runs = sum(1 for r in run_lengths if r > avg_run * 2)
+    long_ratio = long_runs / len(run_lengths) if run_lengths else 0
+
+    # Cursive: many long horizontal runs (connected letters)
+    # Print: mostly short runs (isolated characters)
+    if long_ratio > 0.25:
+        return "cursive"
+    elif long_ratio < 0.10:
+        return "print"
+    else:
+        return "mixed"
 
 
 # ---------------------------------------------------------------------------

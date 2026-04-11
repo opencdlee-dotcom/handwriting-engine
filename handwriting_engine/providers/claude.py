@@ -84,7 +84,17 @@ class ClaudeProvider:
             "tool_choice": {"type": "any"},
         }
         if system_prompt:
-            kwargs["system"] = system_prompt
+            # Enable prompt caching for long system prompts (same as _call)
+            if len(system_prompt) > 4096:
+                kwargs["system"] = [
+                    {
+                        "type": "text",
+                        "text": system_prompt,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ]
+            else:
+                kwargs["system"] = system_prompt
 
         response = self._client.messages.create(**kwargs)
         self._accumulate(response)
@@ -121,6 +131,9 @@ class ClaudeProvider:
 
                 response = self._client.messages.create(**kwargs)
                 self._accumulate(response)
+                if not response.content:
+                    logger.warning("Claude returned empty response (possible safety refusal)")
+                    return ""
                 return response.content[0].text
 
             except anthropic.BadRequestError as e:
@@ -167,6 +180,9 @@ class ClaudeProvider:
                                 "type": "image",
                                 "source": {"type": "base64", "media_type": result[1], "data": result[0]},
                             })
+                        else:
+                            # Shrink failed — keep original block rather than dropping it
+                            new_content.append(block)
                     finally:
                         if tmp_path and os.path.exists(tmp_path):
                             os.unlink(tmp_path)

@@ -11,11 +11,12 @@ Key optimizations from research:
 from __future__ import annotations
 
 import json
+import math
 import os
 import base64
 import logging
 
-from handwriting_engine._constants import DEFAULT_GEMINI_MODEL
+from handwriting_engine._constants import DEFAULT_GEMINI_MODEL, DEFAULT_GEMINI_TEMPERATURE
 from handwriting_engine.providers.base import retry_api_call
 
 logger = logging.getLogger(__name__)
@@ -24,7 +25,7 @@ logger = logging.getLogger(__name__)
 class GeminiProvider:
     name = "gemini"
 
-    def __init__(self, api_key: str | None = None, model: str | None = None, thinking_budget: int | None = None):
+    def __init__(self, api_key: str | None = None, model: str | None = None, thinking_budget: int | None = None, temperature: float | None = None):
         try:
             from google import genai
         except ImportError:
@@ -37,6 +38,7 @@ class GeminiProvider:
         self._model = model or os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
         self._client = genai.Client(api_key=self._api_key)
         self._usage = {"input_tokens": 0, "output_tokens": 0}
+        self.token_confidences: list[float] = []
 
         # Thinking budget: 0 for Flash (thinking hurts OCR accuracy),
         # 128 (minimum) for Pro. More thinking = more "corrections" = worse OCR.
@@ -47,18 +49,77 @@ class GeminiProvider:
         else:
             self._thinking_budget = 128
 
+        # Temperature: Gemini Flash performs better at 0.5 for OCR (Southbridge.AI study).
+        # Temp 0 triggers degenerate sampling behavior on recognition tasks.
+        if temperature is not None:
+            self._temperature = temperature
+        else:
+            self._temperature = DEFAULT_GEMINI_TEMPERATURE
+
+        # Context cache for batch workflows (90% discount on cached tokens)
+        self._cached_content_name: str | None = None
+        self._cached_system_prompt: str | None = None
+
     def _retryable_exceptions(self) -> tuple:
         from google.api_core.exceptions import ResourceExhausted, ServiceUnavailable, InternalServerError
         return (ResourceExhausted, ServiceUnavailable, InternalServerError)
 
-    def _build_config(self, max_tokens: int, **extra) -> object:
-        """Build GenerateContentConfig with thinking budget applied."""
+    def enable_context_cache(self, system_prompt: str) -> None:
+        """Create an explicit context cache for a system prompt.
+
+        Gemini's CachedContent API gives 90% discount on cached input tokens.
+        Call this before a batch of reads that share the same system prompt.
+        Minimum: 1,024 tokens (Flash), 4,096 tokens (Pro).
+        """
         from google.genai import types
-        kwargs = {"max_output_tokens": max_tokens, "temperature": 0, **extra}
+
+        if self._cached_system_prompt == system_prompt and self._cached_content_name:
+            return  # Already cached
+
+        try:
+            cached = self._client.caches.create(
+                model=self._model,
+                config=types.CreateCachedContentConfig(
+                    system_instruction=system_prompt,
+                    ttl="3600s",  # 1 hour
+                ),
+            )
+            self._cached_content_name = cached.name
+            self._cached_system_prompt = system_prompt
+            logger.info("Gemini context cache created: %s", cached.name)
+        except Exception as e:
+            logger.warning("Context caching failed (will use inline): %s", e)
+            self._cached_content_name = None
+            self._cached_system_prompt = None
+
+    def invalidate_cache(self) -> None:
+        """Clear the context cache."""
+        if self._cached_content_name:
+            try:
+                self._client.caches.delete(self._cached_content_name)
+            except Exception:
+                pass
+            self._cached_content_name = None
+            self._cached_system_prompt = None
+
+    def _build_config(self, max_tokens: int, system_instruction: str = "", **extra) -> object:
+        """Build GenerateContentConfig with thinking budget, system instruction, and media resolution."""
+        from google.genai import types
+        kwargs = {"max_output_tokens": max_tokens, "temperature": self._temperature, "response_logprobs": True, **extra}
+        # Use cached content if available and system prompt matches
+        if (self._cached_content_name
+                and system_instruction
+                and self._cached_system_prompt == system_instruction):
+            kwargs["cached_content"] = self._cached_content_name
+            # Don't send system_instruction when using cache — it's already cached
+        elif system_instruction:
+            kwargs["system_instruction"] = system_instruction
         if self._thinking_budget is not None:
             kwargs["thinking_config"] = types.ThinkingConfig(
                 thinking_budget=self._thinking_budget,
             )
+        # HIGH resolution ensures max detail for handwriting OCR
+        kwargs["media_resolution"] = "MEDIA_RESOLUTION_HIGH"
         return types.GenerateContentConfig(**kwargs)
 
     def read_image(
@@ -74,21 +135,21 @@ class GeminiProvider:
         image_bytes = base64.b64decode(image_b64)
         image_part = types.Part.from_bytes(data=image_bytes, mime_type=media_type)
 
-        full_prompt = f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
-        config = self._build_config(max_tokens)
+        config = self._build_config(max_tokens, system_instruction=system_prompt)
 
         def _call():
             return self._client.models.generate_content(
                 model=self._model,
-                contents=[image_part, full_prompt],
+                contents=[image_part, prompt],
                 config=config,
             )
 
         response = retry_api_call(_call, retryable_exceptions=self._retryable_exceptions())
         self._accumulate(response)
-        # Check for blocked/empty responses (safety filters)
+        self._parse_logprobs(response)
+        # Check for blocked/empty responses (safety filters — OFF by default on 2.5+)
         if not response.candidates:
-            logger.warning("Gemini response blocked (no candidates) — possibly safety-filtered")
+            logger.warning("Gemini response blocked (no candidates) — check input format")
             return ""
         return response.text or ""
 
@@ -114,9 +175,8 @@ class GeminiProvider:
                 elif block.get("type") == "text":
                     parts.append(block["text"])
 
-        full_prompt = f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
-        parts.append(full_prompt)
-        config = self._build_config(max_tokens)
+        parts.append(prompt)
+        config = self._build_config(max_tokens, system_instruction=system_prompt)
 
         def _call():
             return self._client.models.generate_content(
@@ -155,10 +215,10 @@ class GeminiProvider:
                 elif block.get("type") == "text":
                     parts.append(block["text"])
 
-        full_prompt = f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
-        parts.append(full_prompt)
+        parts.append(prompt)
         config = self._build_config(
             max_tokens,
+            system_instruction=system_prompt,
             response_mime_type="application/json",
             response_schema=json_schema,
         )
@@ -172,14 +232,41 @@ class GeminiProvider:
 
         response = retry_api_call(_call, retryable_exceptions=self._retryable_exceptions())
         self._accumulate(response)
+        if not response.candidates:
+            logger.warning("Gemini structured response blocked (no candidates)")
+            return {}
         text = response.text or "{}"
-        return json.loads(text)
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse structured response: {e}")
+            return None
 
     def _accumulate(self, response):
         if hasattr(response, "usage_metadata") and response.usage_metadata:
             um = response.usage_metadata
             self._usage["input_tokens"] += getattr(um, "prompt_token_count", 0) or 0
             self._usage["output_tokens"] += getattr(um, "candidates_token_count", 0) or 0
+
+    def _parse_logprobs(self, response):
+        """Extract per-token confidence scores from Gemini logprobs response."""
+        self.token_confidences = []
+        try:
+            for candidate in response.candidates:
+                logprobs_result = getattr(candidate, "logprobs_result", None)
+                if logprobs_result and hasattr(logprobs_result, "chosen_candidates"):
+                    for token_info in logprobs_result.chosen_candidates:
+                        lp = getattr(token_info, "log_probability", None)
+                        if lp is not None:
+                            self.token_confidences.append(math.exp(lp))
+        except (AttributeError, TypeError):
+            pass
+
+    def get_mean_confidence(self) -> float:
+        """Return average per-token confidence (0.0-1.0) from last read's logprobs."""
+        if not self.token_confidences:
+            return 0.0
+        return sum(self.token_confidences) / len(self.token_confidences)
 
     @property
     def usage(self) -> dict:

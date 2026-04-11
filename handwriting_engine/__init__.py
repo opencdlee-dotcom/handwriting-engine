@@ -18,6 +18,8 @@ from handwriting_engine.quality import (
     assess_contrast,
     assess_brightness,
     batch_assess,
+    recommend_enhancement_params,
+    classify_handwriting_style,
 )
 
 # Image enhancement
@@ -76,6 +78,9 @@ from handwriting_engine.models import (
     ConfigError,
 )
 
+# Prompt adaptation
+from handwriting_engine.prompt_adapter import adapt_system_prompt, adapt_user_prompt
+
 # Vision (lazy — doesn't fail if no API keys)
 def read_page(*args, **kwargs):
     from handwriting_engine.vision import read_page as _rp
@@ -85,9 +90,19 @@ def read_with_consensus(*args, **kwargs):
     from handwriting_engine.vision import read_with_consensus as _rc
     return _rc(*args, **kwargs)
 
+# Writer identification (lazy — needs google-genai)
+def identify_writer(*args, **kwargs):
+    from handwriting_engine.writer_embeddings import identify_writer as _iw
+    return _iw(*args, **kwargs)
+
+def enroll_writer(*args, **kwargs):
+    from handwriting_engine.writer_embeddings import enroll_writer as _ew
+    return _ew(*args, **kwargs)
+
 __all__ = [
     # Quality
     "assess_image", "assess_blur", "assess_contrast", "assess_brightness", "batch_assess",
+    "recommend_enhancement_params", "classify_handwriting_style",
     # Enhancement
     "enhance_image", "smart_enhance", "proven_enhance", "crisp", "llm_enhance", "adaptive_enhance",
     # PDF
@@ -101,8 +116,12 @@ __all__ = [
     # Models & Exceptions
     "PageInfo", "ImageQuality", "PageOrientation", "ContentType", "ConsensusResult",
     "HandwritingEngineError", "ProviderError", "ImageError", "ConfigError",
+    # Prompt adaptation
+    "adapt_system_prompt", "adapt_user_prompt",
     # Vision
     "read_page", "read_with_consensus",
+    # Writer identification
+    "identify_writer", "enroll_writer",
     # Benchmark (subpackage)
     "benchmark",
 ]
