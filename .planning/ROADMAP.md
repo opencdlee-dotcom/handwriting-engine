@@ -38,7 +38,13 @@ Full details: `.planning/milestones/v2.0-ROADMAP.md`
   2. Every benchmark run record includes a `[?]_marker_rate` column separate from CER, so the developer can tell whether a strategy reduced ambiguity markers vs. improved character accuracy.
   3. Developer can execute a 20-sample noise calibration run that prints the CER variance and minimum detectable difference at temperature 0.5 — so the developer knows whether a measured CER delta is real or noise.
   4. Attempting to launch any sweep run first prints an API cost projection (strategies × providers × samples × passes) and requires confirmation before proceeding; no blind cost explosion is possible.
-**Plans**: TBD
+**Plans**: 4 plans
+
+Plans:
+- [ ] 06-01-PLAN.md — Wave 0 test stubs: failing tests for all Phase 6 behaviors (FOUND-01 through FOUND-04)
+- [ ] 06-02-PLAN.md — v4 schema migration + dataclass extensions (db.py, models.py)
+- [ ] 06-03-PLAN.md — Provenance capture + marker rate computation + report display (evaluate.py, report.py)
+- [ ] 06-04-PLAN.md — CLI surface: benchmark calibrate subcommand + cost guardrail + provenance flags (cli.py)
 
 ### Phase 7: IAM Data Ingestion + Sweep Infrastructure
 **Goal**: The developer can load the IAM Handwriting Database into the benchmark system and execute a full multi-strategy sweep against it, with per-writer variance visible in reports.
@@ -78,7 +84,7 @@ Full details: `.planning/milestones/v2.0-ROADMAP.md`
 | 3. New Local Model Providers | v2.0 | 1/1 | ✅ Complete | 2026-04-09 |
 | 4. Preprocessing + Writer Adaptation | v2.0 | 1/1 | ✅ Complete | 2026-04-09 |
 | 5. Post-Processing + Benchmark Suite | v2.0 | 1/1 | ✅ Complete | 2026-04-09 |
-| 6. Measurement Foundation | v3.0 | 0/? | Not started | - |
+| 6. Measurement Foundation | v3.0 | 4/4 | In progress | - |
 | 7. IAM Data Ingestion + Sweep Infrastructure | v3.0 | 0/? | Not started | - |
 | 8. Statistics Layer | v3.0 | 0/? | Not started | - |
 | 9. Final Sweep, Recommendation, and Baseline Lock | v3.0 | 0/? | Not started | - |
