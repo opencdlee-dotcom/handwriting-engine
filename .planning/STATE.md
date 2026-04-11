@@ -1,11 +1,14 @@
 ---
 gsd_state_version: 1.0
 milestone: v3.0
-milestone_name: Verified Accuracy
-current_phase: 6
-current_plan: 1
-status: in_progress
-last_updated: "2026-04-11"
+milestone_name: — Verified Accuracy
+status: unknown
+last_updated: "2026-04-11T20:45:09.677Z"
+progress:
+  total_phases: 4
+  completed_phases: 0
+  total_plans: 4
+  completed_plans: 2
 ---
 
 # Execution State
@@ -52,6 +55,7 @@ v3.0 Progress: [ 6 ][ 7 ][ 8 ][ 9 ]
 | Codebase | ~18,150 LOC Python | post-v2.0 |
 
 ---
+| Phase 06 P02 | 15 | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -63,6 +67,8 @@ v3.0 Progress: [ 6 ][ 7 ][ 8 ][ 9 ]
 - 06-01: Wave 0 RED stubs written before any implementation — Nyquist compliance enforced
 - 06-01: CliRunner imported at module level in test_benchmark_evaluate.py for consistency
 - 06-01: test_calibrate_no_samples_error uses OR condition to tolerate missing command returning non-zero
+- [Phase 06]: Updated base _SCHEMA_SQL alongside migration so fresh :memory: DBs have v4 columns from creation
+- [Phase 06]: _compute_marker_rate() computes [?] token fraction from raw text before normalization in evaluate.py
 
 ### Key Facts for Planning
 
