@@ -260,9 +260,18 @@ class TestMarkerRate:
             "marker_rate is 0 — likely computed after normalize_text() stripped [?] markers"
         )
 
-    def test_marker_rate_in_report(self, seeded_db):
-        """generate_report output must include a marker_rate column."""
-        report = generate_report(db_path=seeded_db)
+    @patch("handwriting_engine.benchmark.evaluate._available_providers")
+    @patch("handwriting_engine.benchmark.evaluate._read_single")
+    def test_marker_rate_in_report(self, mock_read, mock_providers, seeded_db):
+        """generate_report output table must include a marker_rate column."""
+        mock_providers.return_value = ["gemini"]
+        mock_read.return_value = {
+            "text": "[?] mitochondria [?] powerhouse cell",
+            "confidence": 0.7, "latency_ms": 500,
+            "input_tokens": 100, "output_tokens": 50, "error": None,
+        }
+        run_id = run_benchmark(label="marker_report_test", providers=["gemini"], strategies=[], db_path=seeded_db)
+        report = generate_report(run_id=run_id, db_path=seeded_db)
         assert "marker_rate" in report.lower(), "Report missing marker_rate column"
 
 
@@ -383,9 +392,18 @@ class TestProvenanceCapture:
         assert row["model_version"] is not None, "model_version not captured"
         assert row["norm_flags"] is not None, "norm_flags not captured"
 
-    def test_report_contains_provenance_header(self, seeded_db):
+    @patch("handwriting_engine.benchmark.evaluate._available_providers")
+    @patch("handwriting_engine.benchmark.evaluate._read_single")
+    def test_report_contains_provenance_header(self, mock_read, mock_providers, seeded_db):
         """generate_report output must include 'Provenance:' section header."""
-        report = generate_report(db_path=seeded_db)
+        mock_providers.return_value = ["gemini"]
+        mock_read.return_value = {
+            "text": "the mitochondria is the powerhouse of the cell",
+            "confidence": 0.9, "latency_ms": 300,
+            "input_tokens": 80, "output_tokens": 40, "error": None,
+        }
+        run_id = run_benchmark(label="prov_report_test", providers=["gemini"], strategies=[], db_path=seeded_db)
+        report = generate_report(run_id=run_id, db_path=seeded_db)
         assert "Provenance:" in report, f"Provenance header missing from report: {report[:200]}"
 
 
