@@ -76,4 +76,4 @@ Requirements for the benchmarking milestone. Each maps to a roadmap phase.
 
 ---
 *Requirements defined: 2026-04-11*
-*Last updated: 2026-04-11 after v3.0 milestone initialization*
+*Last updated: 2026-04-11 after v3.0 roadmap creation*
