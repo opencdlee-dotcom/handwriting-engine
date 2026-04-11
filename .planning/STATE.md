@@ -3,7 +3,8 @@ gsd_state_version: 1.0
 milestone: v3.0
 milestone_name: Verified Accuracy
 current_phase: 6
-status: ready_to_plan
+current_plan: 1
+status: in_progress
 last_updated: "2026-04-11"
 ---
 
@@ -29,8 +30,8 @@ See: `.planning/PROJECT.md` (updated 2026-04-11)
 | Field | Value |
 |-------|-------|
 | Phase | 6 — Measurement Foundation |
-| Plan | None yet |
-| Status | ready_to_plan |
+| Plan | 01 complete (Wave 0 RED stubs) |
+| Status | in_progress |
 | Progress | Phase 6 of 9 (v3.0 scope: phases 6-9) |
 
 ```
@@ -59,6 +60,9 @@ v3.0 Progress: [ 6 ][ 7 ][ 8 ][ 9 ]
 - Phases 6-9 derived from 12 v3.0 requirements (FOUND, IAM, STAT, RPT categories)
 - Phase ordering follows data dependency: foundation → ingestion → statistics → reporting
 - Research summary file not present; phase grouping from orchestrator instructions used directly
+- 06-01: Wave 0 RED stubs written before any implementation — Nyquist compliance enforced
+- 06-01: CliRunner imported at module level in test_benchmark_evaluate.py for consistency
+- 06-01: test_calibrate_no_samples_error uses OR condition to tolerate missing command returning non-zero
 
 ### Key Facts for Planning
 
@@ -75,7 +79,8 @@ None at roadmap creation time.
 
 ### Todos
 
-- [ ] Run `/gsd:plan-phase 6` to begin Phase 6 planning
+- [x] Run `/gsd:plan-phase 6` to begin Phase 6 planning
+- [x] Execute 06-01 (Wave 0 RED stubs) — complete 2026-04-11
 
 ---
 
@@ -86,6 +91,7 @@ Newest entries first.
 ### Entries
 
 ```
+[2026-04-11] 06-01 COMPLETE — Wave 0 RED stubs written. 12 new failing tests across 2 files (test_benchmark_db.py, test_benchmark_evaluate.py). All existing tests remain GREEN. Commits: d103aed, 84fcd5b.
 [2026-04-11] ROADMAP — v3.0 roadmap created. 4 phases (6-9), 12/12 requirements mapped. Ready to plan Phase 6.
 [2026-04-11] INIT — v3.0 milestone started. Benchmarking focus: validate all v2.0 accuracy claims against IAM and real lab notebooks.
 [2026-04-11] POST-v2.0 — Committed post-v2.0 Codex session work (cb0ae56): skew detection, zoomed verify, prompt_adapter, writer_embeddings, batch_openai, Gemini context caching. 61 new tests.

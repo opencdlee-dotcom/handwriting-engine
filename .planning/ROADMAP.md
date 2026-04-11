@@ -84,7 +84,7 @@ Plans:
 | 3. New Local Model Providers | v2.0 | 1/1 | ✅ Complete | 2026-04-09 |
 | 4. Preprocessing + Writer Adaptation | v2.0 | 1/1 | ✅ Complete | 2026-04-09 |
 | 5. Post-Processing + Benchmark Suite | v2.0 | 1/1 | ✅ Complete | 2026-04-09 |
-| 6. Measurement Foundation | v3.0 | 4/4 | In progress | - |
+| 6. Measurement Foundation | 1/4 | In Progress|  | - |
 | 7. IAM Data Ingestion + Sweep Infrastructure | v3.0 | 0/? | Not started | - |
 | 8. Statistics Layer | v3.0 | 0/? | Not started | - |
 | 9. Final Sweep, Recommendation, and Baseline Lock | v3.0 | 0/? | Not started | - |
