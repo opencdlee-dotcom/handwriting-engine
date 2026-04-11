@@ -8,16 +8,26 @@ A Python library (`handwriting_engine`) that uses LLM vision APIs (Gemini, Claud
 
 **Core Value:** Highest accuracy handwriting transcription available — better than Azure, GPT-4o, and all dedicated HTR models — now with self-correction and ensemble expansion.
 
-## Current State (post v2.0)
+## Current Milestone: v3.0 — Verified Accuracy
+
+**Goal:** Measure the actual accuracy gains from every v2.0 feature against IAM and real lab notebooks — turning claimed improvements into proven numbers.
+
+**Target outcomes:**
+- CER measured for: baseline, self_correct, line_level, PaddleOCR, prompt_adapter, zoomed verify
+- [?] marker reduction measured on real student lab notebooks
+- Best configuration identified and documented for lab notebook grading use case
+- Regression baseline committed so future changes can't silently regress
+
+## Current State (post v2.0 + post-v2.0 commit)
 
 | Metric | Value |
 |--------|-------|
-| Codebase | ~15,700 LOC Python |
-| Test suite | 442 passing |
+| Codebase | ~18,150 LOC Python |
+| Test suite | 442 passing (+ 61 in test_improvements.py) |
 | Providers | Gemini, Claude, OpenAI, PaddleOCR (optional), TrOCR (optional) |
 | Consensus strategies | vote, best_of, debate, self_correct, smart (uncertainty-gated) |
-| Baseline CER | 1.67% (Gemini Flash, IAM) |
-| Self-correction target | ~1.3% CER (JoD 2025 finding applied) |
+| Baseline CER | 1.67% (Gemini Flash, IAM) — all v2.0 improvements unverified |
+| Self-correction target | ~1.3% CER (JoD 2025 finding applied — unverified) |
 
 ## Requirements
 
@@ -33,12 +43,12 @@ A Python library (`handwriting_engine`) that uses LLM vision APIs (Gemini, Claud
 - ✓ Domain spell correction — `correct_domain_terms(text, domain)` — v2.0
 - ✓ Benchmark `--compare-strategies` and `--preprocessing` CLI flags — v2.0
 
-### Active (next milestone)
+### Active (v3.0 — Verified Accuracy)
 
-- Run IAM benchmark to measure actual CER improvement from self_correct strategy
-- Measure actual [?] marker reduction from line-level segmentation on lab notebooks
-- Install and benchmark PaddleOCR against IAM test set (not yet in dev env)
-- Connect writer_embeddings.py cluster observations → auto-populate WriterProfileStore
+- Benchmark self_correct, line_level, PaddleOCR, prompt_adapter against IAM — confirm CER targets
+- Measure [?] marker reduction from line_level and zoomed verify on real lab notebooks
+- Identify best-configuration recommendation for lab notebook grading
+- Commit regression baseline from benchmark results
 
 ### Out of Scope
 
