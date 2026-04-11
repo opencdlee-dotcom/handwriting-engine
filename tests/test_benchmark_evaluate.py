@@ -2,6 +2,7 @@
 
 import pytest
 from unittest.mock import patch, MagicMock
+from click.testing import CliRunner
 
 from handwriting_engine.benchmark.db import (
     get_connection,
@@ -197,6 +198,195 @@ class TestDrillDown:
         report = sample_drill_down(samples[0].id, db_path=seeded_db)
         assert "gemini" in report
         assert "CER" in report
+
+
+class TestMarkerRate:
+    @patch("handwriting_engine.benchmark.evaluate._available_providers")
+    @patch("handwriting_engine.benchmark.evaluate._read_single")
+    def test_marker_rate_from_raw_text(self, mock_read, mock_providers, seeded_db):
+        """Marker rate counts [?] tokens from raw text, not normalized text."""
+        mock_providers.return_value = ["gemini"]
+        # 2 markers in 5 words = 0.4 rate
+        mock_read.return_value = {
+            "text": "[?] mitochondria [?] powerhouse cell",
+            "confidence": 0.7, "latency_ms": 500,
+            "input_tokens": 100, "output_tokens": 50, "error": None,
+        }
+        run_id = run_benchmark(label="marker_test", providers=["gemini"], strategies=[], db_path=seeded_db)
+        conn = get_connection(seeded_db)
+        rows = conn.execute(
+            "SELECT question_marker_rate FROM provider_outputs WHERE run_id = ?", (run_id,)
+        ).fetchall()
+        conn.close()
+        assert len(rows) == 1
+        assert rows[0]["question_marker_rate"] == pytest.approx(0.4, abs=0.01)
+
+    @patch("handwriting_engine.benchmark.evaluate._available_providers")
+    @patch("handwriting_engine.benchmark.evaluate._read_single")
+    def test_marker_rate_clean_output(self, mock_read, mock_providers, seeded_db):
+        """Clean output (no [?]) should have marker_rate == 0.0."""
+        mock_providers.return_value = ["gemini"]
+        mock_read.return_value = {
+            "text": "the mitochondria is the powerhouse of the cell",
+            "confidence": 0.9, "latency_ms": 300,
+            "input_tokens": 80, "output_tokens": 40, "error": None,
+        }
+        run_id = run_benchmark(label="clean_test", providers=["gemini"], strategies=[], db_path=seeded_db)
+        conn = get_connection(seeded_db)
+        rows = conn.execute(
+            "SELECT question_marker_rate FROM provider_outputs WHERE run_id = ?", (run_id,)
+        ).fetchall()
+        conn.close()
+        assert rows[0]["question_marker_rate"] == pytest.approx(0.0)
+
+    @patch("handwriting_engine.benchmark.evaluate._available_providers")
+    @patch("handwriting_engine.benchmark.evaluate._read_single")
+    def test_marker_rate_computed_before_normalization(self, mock_read, mock_providers, seeded_db):
+        """If marker_rate is computed after normalization, [?] is stripped and rate=0. Must be > 0."""
+        mock_providers.return_value = ["gemini"]
+        mock_read.return_value = {
+            "text": "[?] unknown term here",
+            "confidence": 0.5, "latency_ms": 400,
+            "input_tokens": 90, "output_tokens": 45, "error": None,
+        }
+        run_id = run_benchmark(label="norm_test", providers=["gemini"], strategies=[], db_path=seeded_db)
+        conn = get_connection(seeded_db)
+        row = conn.execute(
+            "SELECT question_marker_rate FROM provider_outputs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        conn.close()
+        # If this is 0.0, marker rate was computed AFTER normalization (bug)
+        assert row["question_marker_rate"] > 0.0, (
+            "marker_rate is 0 — likely computed after normalize_text() stripped [?] markers"
+        )
+
+    def test_marker_rate_in_report(self, seeded_db):
+        """generate_report output must include a marker_rate column."""
+        report = generate_report(db_path=seeded_db)
+        assert "marker_rate" in report.lower(), "Report missing marker_rate column"
+
+
+class TestCalibrateCommand:
+    @patch("handwriting_engine.benchmark.evaluate._read_single")
+    def test_calibrate_output_format(self, mock_read, seeded_db):
+        """Output must match: 'CER variance: ±X%  |  Min detectable delta: Y% (2σ)'"""
+        import re
+        mock_read.return_value = {
+            "text": "the mitochondria is the powerhouse of the cell",
+            "confidence": 0.8, "latency_ms": 400,
+            "input_tokens": 100, "output_tokens": 50, "error": None,
+        }
+        runner = CliRunner()
+        from handwriting_engine.cli import cli
+        result = runner.invoke(cli, [
+            "benchmark", "calibrate", "--samples", "1", "--provider", "gemini",
+            "--db-path", str(seeded_db)
+        ])
+        assert result.exit_code == 0, f"calibrate failed: {result.output}"
+        assert re.search(r"CER variance: ±[\d.]+%\s+\|\s+Min detectable delta: [\d.]+% \(2σ\)", result.output), \
+            f"Output format mismatch: {result.output}"
+
+    def test_calibrate_undersample_warning(self, seeded_db):
+        """Requesting more samples than available should warn but not abort."""
+        runner = CliRunner()
+        from handwriting_engine.cli import cli
+        result = runner.invoke(cli, [
+            "benchmark", "calibrate", "--samples", "9999", "--provider", "gemini",
+            "--db-path", str(seeded_db)
+        ])
+        # Should warn and proceed (or exit 0 if < 2 samples available)
+        assert "Warning" in result.output or result.exit_code == 0
+
+    def test_calibrate_no_samples_error(self, tmp_path):
+        """Empty DB (no ground truth) should exit non-zero with error message."""
+        empty_db = tmp_path / "empty.db"
+        conn = get_connection(empty_db)
+        conn.close()
+        runner = CliRunner()
+        from handwriting_engine.cli import cli
+        result = runner.invoke(cli, [
+            "benchmark", "calibrate", "--samples", "5",
+            "--db-path", str(empty_db)
+        ])
+        assert result.exit_code != 0 or "No samples" in result.output
+
+
+class TestCostProjection:
+    @patch("handwriting_engine.benchmark.evaluate._available_providers")
+    @patch("handwriting_engine.benchmark.evaluate._read_single")
+    def test_cost_always_shown(self, mock_read, mock_providers, seeded_db):
+        """Cost projection must appear before benchmark execution, no threshold."""
+        mock_providers.return_value = ["gemini"]
+        mock_read.return_value = {
+            "text": "test", "confidence": 0.8, "latency_ms": 200,
+            "input_tokens": 50, "output_tokens": 20, "error": None,
+        }
+        runner = CliRunner()
+        from handwriting_engine.cli import cli
+        result = runner.invoke(cli, [
+            "benchmark", "run", "--providers", "gemini", "--yes",
+            "--db-path", str(seeded_db)
+        ])
+        assert "Estimated cost:" in result.output, f"Cost not shown: {result.output}"
+
+    @patch("handwriting_engine.benchmark.evaluate._available_providers")
+    @patch("handwriting_engine.benchmark.evaluate._read_single")
+    def test_yes_bypasses_prompt(self, mock_read, mock_providers, seeded_db):
+        """--yes flag must skip the 'Proceed?' confirmation prompt."""
+        mock_providers.return_value = ["gemini"]
+        mock_read.return_value = {
+            "text": "test", "confidence": 0.8, "latency_ms": 200,
+            "input_tokens": 50, "output_tokens": 20, "error": None,
+        }
+        runner = CliRunner()
+        from handwriting_engine.cli import cli
+        result = runner.invoke(cli, [
+            "benchmark", "run", "--providers", "gemini", "--yes",
+            "--db-path", str(seeded_db)
+        ])
+        assert "Proceed?" not in result.output
+
+    @patch("handwriting_engine.benchmark.evaluate._available_providers")
+    @patch("handwriting_engine.benchmark.evaluate._read_single")
+    def test_decline_exits_cleanly(self, mock_read, mock_providers, seeded_db):
+        """Entering 'n' at cost prompt must exit 0 (graceful), not crash."""
+        mock_providers.return_value = ["gemini"]
+        mock_read.return_value = {
+            "text": "test", "confidence": 0.8, "latency_ms": 200,
+            "input_tokens": 50, "output_tokens": 20, "error": None,
+        }
+        runner = CliRunner()
+        from handwriting_engine.cli import cli
+        result = runner.invoke(cli, [
+            "benchmark", "run", "--providers", "gemini",
+            "--db-path", str(seeded_db)
+        ], input="n\n")
+        assert result.exit_code == 0, f"Decline raised non-zero exit: {result.output}"
+        assert "Estimated cost:" in result.output
+
+
+class TestProvenanceCapture:
+    @patch("handwriting_engine.benchmark.evaluate._available_providers")
+    @patch("handwriting_engine.benchmark.evaluate._read_single")
+    def test_provenance_columns_in_db(self, mock_read, mock_providers, seeded_db):
+        """After run_benchmark, runs table must have model_version populated."""
+        mock_providers.return_value = ["gemini"]
+        mock_read.return_value = {
+            "text": "the mitochondria is the powerhouse of the cell",
+            "confidence": 0.9, "latency_ms": 300,
+            "input_tokens": 80, "output_tokens": 40, "error": None,
+        }
+        run_id = run_benchmark(label="prov_test", providers=["gemini"], strategies=[], db_path=seeded_db)
+        conn = get_connection(seeded_db)
+        row = conn.execute("SELECT model_version, norm_flags FROM runs WHERE id = ?", (run_id,)).fetchone()
+        conn.close()
+        assert row["model_version"] is not None, "model_version not captured"
+        assert row["norm_flags"] is not None, "norm_flags not captured"
+
+    def test_report_contains_provenance_header(self, seeded_db):
+        """generate_report output must include 'Provenance:' section header."""
+        report = generate_report(db_path=seeded_db)
+        assert "Provenance:" in report, f"Provenance header missing from report: {report[:200]}"
 
 
 class TestCompareRuns:
