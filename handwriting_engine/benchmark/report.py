@@ -36,6 +36,8 @@ def _aggregate_results(rows: list[dict]) -> list[StrategyResult]:
         total_out = sum(r.get("output_tokens", 0) or 0 for r in group_rows)
 
         cost = estimate_cost(total_in, total_out, provider)
+        marker_rates = [r.get("question_marker_rate") for r in group_rows if r.get("question_marker_rate") is not None]
+        mean_marker_rate = statistics.mean(marker_rates) if marker_rates else 0.0
 
         results.append(StrategyResult(
             provider=provider,
@@ -50,6 +52,7 @@ def _aggregate_results(rows: list[dict]) -> list[StrategyResult]:
             estimated_cost_usd=cost,
             sample_count=len(group_rows),
             failures=failures,
+            mean_marker_rate=mean_marker_rate,
         ))
 
     return results
@@ -78,6 +81,11 @@ def generate_report(
                 return "No benchmark runs found. Run 'handwriting-engine benchmark run' first."
 
         rows = get_run_results(conn, run_id)
+        run_meta_row = conn.execute(
+            "SELECT model_version, iam_partition, norm_flags, vocab_hints_off FROM runs WHERE id = ?",
+            (run_id,)
+        ).fetchone()
+        run_meta = dict(run_meta_row) if run_meta_row else None
     finally:
         conn.close()
 
@@ -90,14 +98,27 @@ def generate_report(
         return _format_json(run_id, results)
     elif fmt == "csv":
         return _format_csv(results)
-    return _format_table(run_id, results)
+    return _format_table(run_id, results, run_meta=run_meta)
 
 
-def _format_table(run_id: int, results: list[StrategyResult]) -> str:
-    """Render results as an ASCII table."""
+def _format_table(run_id: int, results: list[StrategyResult], run_meta: dict | None = None) -> str:
+    """Render results as an ASCII table with optional provenance header."""
     lines = [f"Benchmark Run #{run_id}", ""]
 
-    header = f"{'Provider':<20} {'Strategy':<10} {'CER':>8} {'±sd':>6} {'WER':>8} {'Tokens':>10} {'Cost':>8} {'N':>4} {'Fail':>4}"
+    if run_meta:
+        lines.append("Provenance:")
+        lines.append(f"  Model:      {run_meta.get('model_version') or 'unknown'}")
+        partition = run_meta.get('iam_partition') or 'n/a'
+        lines.append(f"  Partition:  {partition}")
+        lines.append(f"  Norm flags: {run_meta.get('norm_flags') or 'unknown'}")
+        vocab_off = 'yes' if run_meta.get('vocab_hints_off') else 'no'
+        lines.append(f"  Vocab hints off: {vocab_off}")
+        lines.append("")
+
+    header = (
+        f"{'Provider':<20} {'Strategy':<10} {'CER':>8} {'±sd':>6} {'WER':>8} "
+        f"{'marker_rate':>11} {'Tokens':>10} {'Cost':>8} {'N':>4} {'Fail':>4}"
+    )
     lines.append(header)
     lines.append("-" * len(header))
 
@@ -106,9 +127,10 @@ def _format_table(run_id: int, results: list[StrategyResult]) -> str:
         sd_str = f"{r.stdev_cer:.2%}" if r.stdev_cer > 0 else "---"
         wer_str = f"{r.mean_wer:.2%}" if r.mean_wer >= 0 else "N/A"
         cost_str = f"${r.estimated_cost_usd:.4f}"
+        marker_pct = f"{r.mean_marker_rate * 100:.2f}%"
         lines.append(
             f"{r.provider:<20} {r.strategy:<10} {cer_str:>8} {sd_str:>6} {wer_str:>8} "
-            f"{r.total_tokens:>10,} {cost_str:>8} {r.sample_count:>4} {r.failures:>4}"
+            f"{marker_pct:>11} {r.total_tokens:>10,} {cost_str:>8} {r.sample_count:>4} {r.failures:>4}"
         )
 
     lines.append("")
