@@ -22,7 +22,7 @@ Full details: `.planning/milestones/v2.0-ROADMAP.md`
 
 ### v3.0 — Verified Accuracy
 
-- [ ] **Phase 6: Measurement Foundation** — Reproducible baseline + variance floor + cost guardrails
+- [x] **Phase 6: Measurement Foundation** — Reproducible baseline + variance floor + cost guardrails (completed 2026-04-11)
 - [ ] **Phase 7: IAM Data Ingestion + Sweep Infrastructure** — Full IAM benchmark pipeline
 - [ ] **Phase 8: Statistics Layer** — Statistical defensibility for all comparisons
 - [ ] **Phase 9: Final Sweep, Recommendation, and Baseline Lock** — Best config identified, regression anchor committed
@@ -84,7 +84,7 @@ Plans:
 | 3. New Local Model Providers | v2.0 | 1/1 | ✅ Complete | 2026-04-09 |
 | 4. Preprocessing + Writer Adaptation | v2.0 | 1/1 | ✅ Complete | 2026-04-09 |
 | 5. Post-Processing + Benchmark Suite | v2.0 | 1/1 | ✅ Complete | 2026-04-09 |
-| 6. Measurement Foundation | 3/4 | In Progress|  | - |
+| 6. Measurement Foundation | 4/4 | Complete   | 2026-04-11 | - |
 | 7. IAM Data Ingestion + Sweep Infrastructure | v3.0 | 0/? | Not started | - |
 | 8. Statistics Layer | v3.0 | 0/? | Not started | - |
 | 9. Final Sweep, Recommendation, and Baseline Lock | v3.0 | 0/? | Not started | - |

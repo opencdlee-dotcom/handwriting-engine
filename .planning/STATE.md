@@ -3,12 +3,12 @@ gsd_state_version: 1.0
 milestone: v3.0
 milestone_name: — Verified Accuracy
 status: unknown
-last_updated: "2026-04-11T20:45:09.677Z"
+last_updated: "2026-04-11T21:11:40.993Z"
 progress:
   total_phases: 4
-  completed_phases: 0
+  completed_phases: 1
   total_plans: 4
-  completed_plans: 2
+  completed_plans: 4
 ---
 
 # Execution State
@@ -57,6 +57,7 @@ v3.0 Progress: [ 6 ][ 7 ][ 8 ][ 9 ]
 ---
 | Phase 06 P02 | 15 | 2 tasks | 3 files |
 | Phase 06 P03 | 30 | 2 tasks | 4 files |
+| Phase 06 P04 | 15 | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -73,6 +74,9 @@ v3.0 Progress: [ 6 ][ 7 ][ 8 ][ 9 ]
 - [Phase 06 P03]: _resolve_model_version() uses DEFAULT_*_MODEL constants from _constants.py (not GEMINI_MODEL etc.)
 - [Phase 06 P03]: Two test stubs (test_marker_rate_in_report, test_report_contains_provenance_header) fixed — missing run setup caused false failures on empty DB
 - [Phase 06 P03]: list_runs() in db.py uses r.keys() check for graceful degradation on pre-v4 DBs
+- [Phase 06]: Use statistics.pstdev (not stdev) for calibrate so single-sample calibration returns 0.0 variance instead of raising StatisticsError
+- [Phase 06]: Import _read_single via module reference in calibrate command so test mocks intercept correctly
+- [Phase 06]: vocab_hints_off promoted from hardcoded 0 to proper parameter threaded from CLI through run_benchmark() to insert_run()
 
 ### Key Facts for Planning
 
