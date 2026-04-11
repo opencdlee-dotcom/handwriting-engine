@@ -54,6 +54,7 @@ def _available_providers() -> list[str]:
 def _read_single(
     image_path: str, provider: str, domain: str,
     auto_enhance: bool = False, inject_lessons: bool = False,
+    enhance_strategy: str | None = None,
 ) -> dict:
     """Read a single image with one provider. Returns result dict."""
     from handwriting_engine.vision import read_page
@@ -61,13 +62,14 @@ def _read_single(
     # Optionally enhance before reading (matches production pipeline)
     # Always write to a temp file to avoid corrupting benchmark source images
     actual_path = image_path
-    if auto_enhance:
+    if auto_enhance or enhance_strategy:
+        strategy = enhance_strategy or "smart"
         try:
             import tempfile
             from handwriting_engine.enhance import enhance_image
             with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
                 tmp_path = f.name
-            actual_path = enhance_image(image_path, strategy="smart", output_path=tmp_path)
+            actual_path = enhance_image(image_path, strategy=strategy, output_path=tmp_path)
         except Exception:
             actual_path = image_path
 
@@ -179,6 +181,7 @@ def run_benchmark(
     mode: str = "full",
     auto_enhance: bool = False,
     inject_lessons: bool = False,
+    enhance_strategy: str | None = None,
 ) -> int:
     """Execute a full benchmark run.
 
@@ -198,6 +201,8 @@ def run_benchmark(
         mode: 'full' (all samples) or 'smoke' (3 hardest samples only).
         auto_enhance: Apply smart enhancement before reading (matches production).
         inject_lessons: Inject lessons into vision prompts (matches production).
+        enhance_strategy: Named enhancement strategy (e.g. 'sauvola', 'proven').
+            When set, implies auto_enhance=True with the specified strategy.
 
     Returns:
         The run ID.
@@ -206,7 +211,7 @@ def run_benchmark(
     try:
         return _run_benchmark_inner(
             conn, label, providers, strategies, domain, sample_ids,
-            on_progress, mode, auto_enhance, inject_lessons,
+            on_progress, mode, auto_enhance, inject_lessons, enhance_strategy,
         )
     finally:
         conn.close()
@@ -223,6 +228,7 @@ def _run_benchmark_inner(
     mode: str,
     auto_enhance: bool = False,
     inject_lessons: bool = False,
+    enhance_strategy: str | None = None,
 ) -> int:
     """Inner benchmark logic with connection managed by caller."""
     # Resolve providers
@@ -273,7 +279,7 @@ def _run_benchmark_inner(
 
         # Single-provider reads
         for provider in providers:
-            result = _read_single(sample.image_path, provider, domain, auto_enhance, inject_lessons)
+            result = _read_single(sample.image_path, provider, domain, auto_enhance, inject_lessons, enhance_strategy)
             po_id = insert_provider_output(
                 conn,
                 run_id=run_id,

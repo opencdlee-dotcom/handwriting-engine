@@ -248,19 +248,29 @@ def benchmark_list(show_samples, show_runs):
 @click.option("--smoke", is_flag=True, help="Smoke test: 3 hardest samples, cheapest provider")
 @click.option("--enhance", is_flag=True, help="Apply smart enhancement before reading (matches production)")
 @click.option("--inject-lessons", is_flag=True, help="Inject lessons into prompts (matches production)")
-def benchmark_run_cmd(label, providers, strategies, domain, feed_lessons, smoke, enhance, inject_lessons):
+@click.option("--compare-strategies", default=None, help="Run multiple strategies and print CER comparison table (e.g. vote,best_of,self_correct)")
+@click.option("--preprocessing", default=None, help="Apply a named enhance strategy before reading (e.g. sauvola, proven, clahe)")
+def benchmark_run_cmd(label, providers, strategies, domain, feed_lessons, smoke, enhance, inject_lessons, compare_strategies, preprocessing):
     """Run all providers/strategies against samples with ground truth.
 
     Only samples that have ground-truth transcriptions are evaluated.
     Skips providers whose SDK is not installed.
     """
-    from handwriting_engine.benchmark.evaluate import run_benchmark
+    from handwriting_engine.benchmark.evaluate import run_benchmark, compare_strategies as run_compare
     from handwriting_engine.benchmark.report import generate_report
     from handwriting_engine.benchmark.lessons_bridge import feed_errors_to_lessons
+
+    if compare_strategies:
+        strat_list = [s.strip() for s in compare_strategies.split(",")]
+        click.echo(run_compare(strat_list, domain=domain))
+        return
 
     prov_list = [p.strip() for p in providers.split(",")] if providers else None
     strat_list = [s.strip() for s in strategies.split(",")] if strategies else None
     mode = "smoke" if smoke else "full"
+
+    if preprocessing and not enhance:
+        enhance = True
 
     def progress(current, total, msg):
         click.echo(f"  [{current}/{total}] {msg}")
@@ -270,6 +280,7 @@ def benchmark_run_cmd(label, providers, strategies, domain, feed_lessons, smoke,
             label=label, providers=prov_list, strategies=strat_list, domain=domain,
             on_progress=progress, mode=mode,
             auto_enhance=enhance, inject_lessons=inject_lessons,
+            enhance_strategy=preprocessing,
         )
     except RuntimeError as e:
         click.echo(f"Error: {e}", err=True)

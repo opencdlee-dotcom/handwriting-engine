@@ -15,6 +15,10 @@ from PIL import Image, ImageOps
 
 logger = logging.getLogger(__name__)
 
+
+class ImagePreparationError(ValueError):
+    """Raised when one or more images cannot be prepared for a vision request."""
+
 from handwriting_engine._constants import (
     DPI_TIERS,
     JPEG_QUALITY,
@@ -110,6 +114,7 @@ def build_image_blocks(
         List of content-block dicts (image + text pairs) ready for API use.
     """
     image_blocks: list[dict] = []
+    skipped_pages: list[str] = []
 
     for page in pages:
         result = validate_and_prepare_image(
@@ -118,6 +123,7 @@ def build_image_blocks(
             jpeg_quality=jpeg_quality,
         )
         if result is None:
+            skipped_pages.append(str(page.get("page_number", page["path"])))
             continue
 
         data, media_type = result
@@ -129,6 +135,10 @@ def build_image_blocks(
             "type": "text",
             "text": f"[Page {page['page_number']}]",
         })
+
+    if skipped_pages:
+        page_list = ", ".join(skipped_pages)
+        logger.warning("Skipped %d page(s) that could not be prepared: %s", len(skipped_pages), page_list)
 
     return image_blocks
 
@@ -159,6 +169,7 @@ def batch_pages_by_size(
     batches: list[list[dict]] = []
     current_batch: list[dict] = []
     current_size = 0
+    skipped_pages: list[str] = []
 
     for page in pages:
         result = validate_and_prepare_image(
@@ -167,6 +178,7 @@ def batch_pages_by_size(
             jpeg_quality=jpeg_quality,
         )
         if result is None:
+            skipped_pages.append(str(page.get("page_number", page["path"])))
             continue
 
         b64_data, _ = result
@@ -181,6 +193,7 @@ def batch_pages_by_size(
                 jpeg_quality=50,
             )
             if result is None:
+                skipped_pages.append(str(page.get("page_number", page["path"])))
                 continue
             b64_data, _ = result
             image_size = len(b64_data)
@@ -196,6 +209,12 @@ def batch_pages_by_size(
 
     if current_batch:
         batches.append(current_batch)
+
+    if skipped_pages:
+        page_list = ", ".join(dict.fromkeys(skipped_pages))
+        raise ImagePreparationError(
+            f"Could not prepare page image(s) for vision request: {page_list}"
+        )
 
     return batches
 

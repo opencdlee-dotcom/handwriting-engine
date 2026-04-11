@@ -640,6 +640,7 @@ _RULE_BLOCKS = {
 def get_reading_strategies(
     domain: str = "biology",
     content_type: str = "default",
+    writer_profile: dict | None = None,
 ) -> str:
     """
     Build a handwriting reading strategy block tailored to content type.
@@ -651,12 +652,29 @@ def get_reading_strategies(
     Args:
         domain: Subject domain ('biology', 'general', or any key in DOMAIN_RULES)
         content_type: Type of content being read (see _CONTENT_TYPE_RULES keys)
+        writer_profile: Optional writer profile dict from WriterProfileStore. When
+            provided, replaces the generic WRITER_CALIBRATION block with
+            writer-specific observations (letter formations, crossing habits, etc.).
 
     Returns:
         Multi-line string with applicable reading strategies
     """
     rule_keys = _CONTENT_TYPE_RULES.get(content_type, _CONTENT_TYPE_RULES["default"])
-    sections = [_RULE_BLOCKS[k]() for k in rule_keys if k in _RULE_BLOCKS]
+
+    if writer_profile:
+        from handwriting_engine.writer_profile_store import WriterProfileStore
+        store = WriterProfileStore()
+        calibration_block = store.build_calibration_block(writer_profile)
+        sections = []
+        for k in rule_keys:
+            if k not in _RULE_BLOCKS:
+                continue
+            if k == "calibration" and calibration_block:
+                sections.append(calibration_block)
+            else:
+                sections.append(_RULE_BLOCKS[k]())
+    else:
+        sections = [_RULE_BLOCKS[k]() for k in rule_keys if k in _RULE_BLOCKS]
 
     if domain in DOMAIN_RULES:
         sections.append(DOMAIN_RULES[domain])

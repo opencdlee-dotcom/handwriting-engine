@@ -281,8 +281,18 @@ def read_page(
         )
 
     # Reading strategies go in system prompt (enables prompt caching, better model attention)
+    # Load writer profile first so it can replace the generic calibration block
+    writer_profile_dict = None
+    if writer_id:
+        from handwriting_engine.writer_profile_store import WriterProfileStore
+        writer_profile_dict = WriterProfileStore().load(writer_id)
+
     if inject_strategies:
-        strategies = get_reading_strategies(domain=domain, content_type=detected_content_type)
+        strategies = get_reading_strategies(
+            domain=domain,
+            content_type=detected_content_type,
+            writer_profile=writer_profile_dict,
+        )
         system_prompt = strategies + ("\n\n" + system_prompt if system_prompt else "")
 
     # Inject faint content protocol when image has faint ink
@@ -296,7 +306,7 @@ def read_page(
         if lessons:
             system_prompt = system_prompt + "\n\n" + lessons if system_prompt else lessons
 
-    # Inject writer-specific calibration if available
+    # Inject writer-specific calibration from lessons store (supplements WriterProfileStore)
     if writer_id:
         from handwriting_engine.lessons import load_writer_calibration
         writer_cal = load_writer_calibration(writer_id)
@@ -556,10 +566,20 @@ def read_with_consensus(
             "Do NOT guess — if unsure, flag it rather than producing a confident wrong reading."
         )
 
+    # Load writer profile first so it can replace the generic calibration block
+    writer_profile_dict = None
+    if writer_id:
+        from handwriting_engine.writer_profile_store import WriterProfileStore
+        writer_profile_dict = WriterProfileStore().load(writer_id)
+
     # Reading strategies go in system prompt for better model attention + caching
     system_prompt = ""
     if inject_strategies:
-        strategies = get_reading_strategies(domain=domain, content_type=content_type)
+        strategies = get_reading_strategies(
+            domain=domain,
+            content_type=content_type,
+            writer_profile=writer_profile_dict,
+        )
         system_prompt = strategies
 
     # Inject learned lessons from past corrections
@@ -569,7 +589,7 @@ def read_with_consensus(
         if lessons:
             system_prompt = system_prompt + "\n\n" + lessons if system_prompt else lessons
 
-    # Inject writer-specific calibration if available
+    # Inject writer-specific calibration from lessons store (supplements WriterProfileStore)
     if writer_id:
         from handwriting_engine.lessons import load_writer_calibration
         writer_cal = load_writer_calibration(writer_id)
