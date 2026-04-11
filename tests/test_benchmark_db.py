@@ -53,6 +53,17 @@ class TestSchemaCreation:
         from handwriting_engine.benchmark.db import ensure_schema
         ensure_schema(db)
 
+    def test_v4_migration_columns(self, db):
+        """v4 migration must add provenance columns to runs and marker_rate to provider_outputs."""
+        runs_cols = {row["name"] for row in db.execute("PRAGMA table_info(runs)").fetchall()}
+        assert "model_version" in runs_cols, "runs.model_version missing — v4 migration not applied"
+        assert "iam_partition" in runs_cols, "runs.iam_partition missing — v4 migration not applied"
+        assert "norm_flags" in runs_cols, "runs.norm_flags missing — v4 migration not applied"
+        assert "vocab_hints_off" in runs_cols, "runs.vocab_hints_off missing — v4 migration not applied"
+
+        po_cols = {row["name"] for row in db.execute("PRAGMA table_info(provider_outputs)").fetchall()}
+        assert "question_marker_rate" in po_cols, "provider_outputs.question_marker_rate missing — v4 migration not applied"
+
 
 class TestSamples:
     def test_insert_and_retrieve(self, db):
