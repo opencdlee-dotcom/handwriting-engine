@@ -33,7 +33,7 @@ See: `.planning/PROJECT.md` (updated 2026-04-11)
 | Field | Value |
 |-------|-------|
 | Phase | 6 — Measurement Foundation |
-| Plan | 01 complete (Wave 0 RED stubs) |
+| Plan | 03 complete (Provenance capture + report display) |
 | Status | in_progress |
 | Progress | Phase 6 of 9 (v3.0 scope: phases 6-9) |
 
@@ -56,6 +56,7 @@ v3.0 Progress: [ 6 ][ 7 ][ 8 ][ 9 ]
 
 ---
 | Phase 06 P02 | 15 | 2 tasks | 3 files |
+| Phase 06 P03 | 30 | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -69,6 +70,9 @@ v3.0 Progress: [ 6 ][ 7 ][ 8 ][ 9 ]
 - 06-01: test_calibrate_no_samples_error uses OR condition to tolerate missing command returning non-zero
 - [Phase 06]: Updated base _SCHEMA_SQL alongside migration so fresh :memory: DBs have v4 columns from creation
 - [Phase 06]: _compute_marker_rate() computes [?] token fraction from raw text before normalization in evaluate.py
+- [Phase 06 P03]: _resolve_model_version() uses DEFAULT_*_MODEL constants from _constants.py (not GEMINI_MODEL etc.)
+- [Phase 06 P03]: Two test stubs (test_marker_rate_in_report, test_report_contains_provenance_header) fixed — missing run setup caused false failures on empty DB
+- [Phase 06 P03]: list_runs() in db.py uses r.keys() check for graceful degradation on pre-v4 DBs
 
 ### Key Facts for Planning
 
@@ -97,6 +101,7 @@ Newest entries first.
 ### Entries
 
 ```
+[2026-04-11] 06-03 COMPLETE — Provenance capture + marker rate wired in evaluate.py; Provenance header + marker_rate column added to report.py; list_runs() in db.py extended. Two test stubs fixed (missing run setup). 4 files modified.
 [2026-04-11] 06-01 COMPLETE — Wave 0 RED stubs written. 12 new failing tests across 2 files (test_benchmark_db.py, test_benchmark_evaluate.py). All existing tests remain GREEN. Commits: d103aed, 84fcd5b.
 [2026-04-11] ROADMAP — v3.0 roadmap created. 4 phases (6-9), 12/12 requirements mapped. Ready to plan Phase 6.
 [2026-04-11] INIT — v3.0 milestone started. Benchmarking focus: validate all v2.0 accuracy claims against IAM and real lab notebooks.

@@ -43,7 +43,7 @@ Full details: `.planning/milestones/v2.0-ROADMAP.md`
 Plans:
 - [ ] 06-01-PLAN.md — Wave 0 test stubs: failing tests for all Phase 6 behaviors (FOUND-01 through FOUND-04)
 - [ ] 06-02-PLAN.md — v4 schema migration + dataclass extensions (db.py, models.py)
-- [ ] 06-03-PLAN.md — Provenance capture + marker rate computation + report display (evaluate.py, report.py)
+- [x] 06-03-PLAN.md — Provenance capture + marker rate computation + report display (evaluate.py, report.py)
 - [ ] 06-04-PLAN.md — CLI surface: benchmark calibrate subcommand + cost guardrail + provenance flags (cli.py)
 
 ### Phase 7: IAM Data Ingestion + Sweep Infrastructure
@@ -84,7 +84,7 @@ Plans:
 | 3. New Local Model Providers | v2.0 | 1/1 | ✅ Complete | 2026-04-09 |
 | 4. Preprocessing + Writer Adaptation | v2.0 | 1/1 | ✅ Complete | 2026-04-09 |
 | 5. Post-Processing + Benchmark Suite | v2.0 | 1/1 | ✅ Complete | 2026-04-09 |
-| 6. Measurement Foundation | 2/4 | In Progress|  | - |
+| 6. Measurement Foundation | 3/4 | In Progress|  | - |
 | 7. IAM Data Ingestion + Sweep Infrastructure | v3.0 | 0/? | Not started | - |
 | 8. Statistics Layer | v3.0 | 0/? | Not started | - |
 | 9. Final Sweep, Recommendation, and Baseline Lock | v3.0 | 0/? | Not started | - |
