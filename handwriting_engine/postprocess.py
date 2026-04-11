@@ -140,7 +140,15 @@ def correct_domain_terms(text: str, domain: str = "biology") -> str:
         while i < len(stripped) and not stripped[i].isalpha():
             prefix += stripped[i]
             i += 1
-        core = stripped[i:]
+        core_raw = stripped[i:]
+
+        # Also strip trailing non-alpha chars (closing brackets, parens, etc.)
+        # that rstrip(".,;:!?") misses, appending them to suffix
+        j = len(core_raw)
+        while j > 0 and not core_raw[j - 1].isalpha():
+            j -= 1
+        core = core_raw[:j]
+        suffix = core_raw[j:] + suffix
 
         # Skip short words, numbers, [?] markers, abbreviations
         if len(core) < 4 or _SKIP_RE.match(core):
@@ -149,9 +157,17 @@ def correct_domain_terms(text: str, domain: str = "biology") -> str:
 
         candidates = _edit_distance_1_candidates(core, wordlist)
         if len(candidates) == 1:
+            # Guard: for short words (< 6 chars), only allow insertion-type corrections
+            # (candidate is longer = a missing letter was found). Replacement corrections
+            # on short words produce false positives: "bell"→"cell", "sell"→"cell", etc.
+            if len(core) < 6 and len(candidates[0]) <= len(core):
+                corrected.append(word)
+                continue
             # Preserve original capitalization
             candidate = candidates[0]
-            if core[0].isupper():
+            if core.isupper():
+                candidate = candidate.upper()
+            elif core[0].isupper():
                 candidate = candidate.capitalize()
             corrected_word = prefix + candidate + suffix
             corrected.append(corrected_word)

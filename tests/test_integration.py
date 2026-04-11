@@ -7,12 +7,11 @@ reading (with mock providers) → consensus. No real API calls.
 import os
 import tempfile
 
-import pytest
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 
 from handwriting_engine.enhance import enhance_image, adaptive_enhance
 from handwriting_engine.optimize import validate_and_prepare_image, is_blank_page
-from handwriting_engine.quality import assess_image, recommend_enhancement_params
+from handwriting_engine.quality import assess_image, recommend_enhancement_params, classify_handwriting_style
 
 
 # ---------------------------------------------------------------------------
@@ -266,5 +265,30 @@ class TestBlankPageDetection:
             with open(path, "wb") as f:
                 f.write(b"corrupt")
             assert is_blank_page(path) is False
+        finally:
+            os.unlink(path)
+
+
+# ---------------------------------------------------------------------------
+# Handwriting Style Classification
+# ---------------------------------------------------------------------------
+
+class TestStyleClassification:
+    def test_returns_valid_style(self):
+        img = _create_text_image()
+        path = _save_tmp(img)
+        try:
+            style = classify_handwriting_style(path)
+            assert style in ("print", "cursive", "mixed")
+        finally:
+            os.unlink(path)
+
+    def test_corrupt_image_returns_mixed(self):
+        fd, path = tempfile.mkstemp(suffix=".jpg")
+        os.close(fd)
+        try:
+            with open(path, "wb") as f:
+                f.write(b"corrupt")
+            assert classify_handwriting_style(path) == "mixed"
         finally:
             os.unlink(path)

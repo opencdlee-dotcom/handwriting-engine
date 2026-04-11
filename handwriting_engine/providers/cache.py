@@ -65,6 +65,7 @@ class VisionCache:
             return None
 
         key = self._make_key(provider, image_b64, prompt, system_prompt)
+        conn = None
         with self._lock:
             try:
                 conn = sqlite3.connect(str(self._db_path))
@@ -82,7 +83,8 @@ class VisionCache:
             except sqlite3.Error:
                 pass
             finally:
-                conn.close()
+                if conn:
+                    conn.close()
         return None
 
     def put(self, provider: str, image_b64: str, prompt: str, system_prompt: str, result: str):

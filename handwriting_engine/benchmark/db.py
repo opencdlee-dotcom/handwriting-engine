@@ -144,7 +144,7 @@ def _apply_migrations(conn):
                 logger.warning(f"Migration to v{version} failed (may already be applied): {e}")
                 # Try to update version anyway if columns already exist
                 try:
-                    conn.execute(f"UPDATE schema_version SET version = {version}")
+                    conn.execute("UPDATE schema_version SET version = ?", (version,))
                     conn.commit()
                 except Exception:
                     pass
