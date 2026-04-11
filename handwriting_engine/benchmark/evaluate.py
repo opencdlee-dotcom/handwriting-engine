@@ -27,6 +27,22 @@ logger = logging.getLogger(__name__)
 
 from handwriting_engine._constants import COST_PER_1M_TOKENS
 
+# Fixed string describing the always-on normalization transformations in metrics.py
+_NORM_FLAGS = "nfc,lowercase,strip_markers,collapse_ws"
+
+
+def _resolve_model_version(providers: list[str]) -> str:
+    """Build 'provider/model_string' label for provenance tracking."""
+    from handwriting_engine import _constants as C
+    _PROVIDER_MODELS = {
+        "gemini": getattr(C, "DEFAULT_GEMINI_MODEL", "gemini-unknown"),
+        "claude": getattr(C, "DEFAULT_CLAUDE_MODEL", "claude-unknown"),
+        "openai": getattr(C, "DEFAULT_OPENAI_MODEL", "openai-unknown"),
+    }
+    return ",".join(
+        f"{p}/{_PROVIDER_MODELS.get(p, p)}" for p in providers
+    )
+
 
 def _compute_marker_rate(text: str) -> float:
     """Compute the fraction of words that are [?] uncertainty markers.
@@ -198,6 +214,8 @@ def run_benchmark(
     auto_enhance: bool = False,
     inject_lessons: bool = False,
     enhance_strategy: str | None = None,
+    iam_partition: str | None = None,
+    vocabulary_hints: list[str] | None = None,
 ) -> int:
     """Execute a full benchmark run.
 
@@ -219,6 +237,8 @@ def run_benchmark(
         inject_lessons: Inject lessons into vision prompts (matches production).
         enhance_strategy: Named enhancement strategy (e.g. 'sauvola', 'proven').
             When set, implies auto_enhance=True with the specified strategy.
+        iam_partition: IAM database partition name for provenance tracking (e.g. 'test', 'train').
+        vocabulary_hints: Optional domain vocabulary hints list. If provided, enables vocab hints mode.
 
     Returns:
         The run ID.
@@ -228,6 +248,8 @@ def run_benchmark(
         return _run_benchmark_inner(
             conn, label, providers, strategies, domain, sample_ids,
             on_progress, mode, auto_enhance, inject_lessons, enhance_strategy,
+            iam_partition=iam_partition,
+            vocabulary_hints=vocabulary_hints,
         )
     finally:
         conn.close()
@@ -245,6 +267,8 @@ def _run_benchmark_inner(
     auto_enhance: bool = False,
     inject_lessons: bool = False,
     enhance_strategy: str | None = None,
+    iam_partition: str | None = None,
+    vocabulary_hints: list[str] | None = None,
 ) -> int:
     """Inner benchmark logic with connection managed by caller."""
     # Resolve providers
@@ -273,9 +297,20 @@ def _run_benchmark_inner(
     if not samples:
         raise RuntimeError("No samples with ground truth. Run 'benchmark ingest' and 'benchmark transcribe' first.")
 
-    # Create run
+    # Create run with provenance metadata
     all_strategies = ["single"] + strategies
-    run_id = insert_run(conn, label=label, providers=providers, strategies=all_strategies, domain=domain)
+    vocab_hints_off = 0 if vocabulary_hints else 0  # Phase 6: always 0; capture point for future --vocab-hints-off flag
+    run_id = insert_run(
+        conn,
+        label=label,
+        providers=providers,
+        strategies=all_strategies,
+        domain=domain,
+        model_version=_resolve_model_version(providers),
+        norm_flags=_NORM_FLAGS,
+        iam_partition=iam_partition,
+        vocab_hints_off=vocab_hints_off,
+    )
     logger.info("Benchmark run %d: %d samples, providers=%s, strategies=%s", run_id, len(samples), providers, all_strategies)
 
     evaluated = 0
@@ -331,6 +366,10 @@ def _run_benchmark_inner(
             for strategy in strategies:
                 result = _read_consensus(sample.image_path, providers, strategy, domain)
                 provider_label = "+".join(providers)
+                # Compute marker rate from RAW text BEFORE character_error_rate() normalizes it
+                # CRITICAL: normalize_text() in metrics.py strips [?] — must capture here
+                raw_text = result["text"]
+                consensus_marker_rate = _compute_marker_rate(raw_text) if raw_text else None
                 po_id = insert_provider_output(
                     conn,
                     run_id=run_id,
@@ -343,6 +382,7 @@ def _run_benchmark_inner(
                     input_tokens=result["input_tokens"],
                     output_tokens=result["output_tokens"],
                     error=result["error"],
+                    question_marker_rate=consensus_marker_rate,
                     autocommit=False,
                 )
 
