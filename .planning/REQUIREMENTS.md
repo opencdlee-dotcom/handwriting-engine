@@ -9,10 +9,10 @@ Requirements for the benchmarking milestone. Each maps to a roadmap phase.
 
 ### Measurement Foundation
 
-- [ ] **FOUND-01**: Developer can reproduce the 1.67% CER baseline with a documented provenance record (model version, IAM partition ID, normalization flags, vocabulary hints off) so all future comparisons have a valid anchor.
-- [ ] **FOUND-02**: Benchmark runs store `[?]_marker_rate` as a separate column alongside CER, so strategies that resolve ambiguity are not conflated with those that improve character accuracy.
-- [ ] **FOUND-03**: Developer can run a 20-sample noise floor calibration that measures CER variance at temperature 0.5 and reports the minimum detectable CER difference for this test set.
-- [ ] **FOUND-04**: CLI warns with an API cost projection (strategies × providers × samples × passes) before executing any sweep run, preventing unintended cost explosions.
+- [x] **FOUND-01**: Developer can reproduce the 1.67% CER baseline with a documented provenance record (model version, IAM partition ID, normalization flags, vocabulary hints off) so all future comparisons have a valid anchor.
+- [x] **FOUND-02**: Benchmark runs store `[?]_marker_rate` as a separate column alongside CER, so strategies that resolve ambiguity are not conflated with those that improve character accuracy.
+- [x] **FOUND-03**: Developer can run a 20-sample noise floor calibration that measures CER variance at temperature 0.5 and reports the minimum detectable CER difference for this test set.
+- [x] **FOUND-04**: CLI warns with an API cost projection (strategies × providers × samples × passes) before executing any sweep run, preventing unintended cost explosions.
 
 ### IAM Benchmarking
 
@@ -56,10 +56,10 @@ Requirements for the benchmarking milestone. Each maps to a roadmap phase.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| FOUND-01 | Phase 6 | Pending |
-| FOUND-02 | Phase 6 | Pending |
-| FOUND-03 | Phase 6 | Pending |
-| FOUND-04 | Phase 6 | Pending |
+| FOUND-01 | Phase 6 | Complete |
+| FOUND-02 | Phase 6 | Complete |
+| FOUND-03 | Phase 6 | Complete |
+| FOUND-04 | Phase 6 | Complete |
 | IAM-01 | Phase 7 | Pending |
 | IAM-02 | Phase 7 | Pending |
 | IAM-03 | Phase 7 | Pending |
