@@ -239,6 +239,30 @@ def benchmark_list(show_samples, show_runs):
     conn.close()
 
 
+def _get_avg_tokens_per_read(conn) -> tuple:
+    """Estimate average input/output tokens per read from the most recent run.
+
+    Falls back to conservative defaults (2000 input, 500 output) if no prior runs exist.
+    """
+    try:
+        latest_row = conn.execute(
+            "SELECT id FROM runs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if latest_row is None:
+            return (2000.0, 500.0)
+        latest_run_id = latest_row["id"]
+        avg_row = conn.execute(
+            """SELECT AVG(input_tokens) as avg_in, AVG(output_tokens) as avg_out
+               FROM provider_outputs WHERE run_id = ?""",
+            (latest_run_id,)
+        ).fetchone()
+        avg_in = avg_row["avg_in"] or 2000.0
+        avg_out = avg_row["avg_out"] or 500.0
+        return (avg_in, avg_out)
+    except Exception:
+        return (2000.0, 500.0)
+
+
 @benchmark.command("run")
 @click.option("--label", "-l", default="", help="Label for this run")
 @click.option("--providers", "-p", default=None, help="Comma-separated providers (e.g. gemini,claude)")
@@ -250,13 +274,18 @@ def benchmark_list(show_samples, show_runs):
 @click.option("--inject-lessons", is_flag=True, help="Inject lessons into prompts (matches production)")
 @click.option("--compare-strategies", default=None, help="Run multiple strategies and print CER comparison table (e.g. vote,best_of,self_correct)")
 @click.option("--preprocessing", default=None, help="Apply a named enhance strategy before reading (e.g. sauvola, proven, clahe)")
-def benchmark_run_cmd(label, providers, strategies, domain, feed_lessons, smoke, enhance, inject_lessons, compare_strategies, preprocessing):
+@click.option("--yes", "-y", is_flag=True, help="Skip cost confirmation prompt (CI-friendly)")
+@click.option("--iam-partition", default=None, help="IAM partition label for provenance (e.g. 'test2023')")
+@click.option("--vocab-hints-off", is_flag=True, help="Record that vocabulary hints were disabled for this run")
+@click.option("--db-path", default=None, hidden=True, help="Override DB path (for testing)")
+def benchmark_run_cmd(label, providers, strategies, domain, feed_lessons, smoke, enhance, inject_lessons, compare_strategies, preprocessing, yes, iam_partition, vocab_hints_off, db_path):
     """Run all providers/strategies against samples with ground truth.
 
     Only samples that have ground-truth transcriptions are evaluated.
     Skips providers whose SDK is not installed.
     """
-    from handwriting_engine.benchmark.evaluate import run_benchmark, compare_strategies as run_compare
+    from handwriting_engine.benchmark.evaluate import run_benchmark, compare_strategies as run_compare, estimate_cost, _available_providers
+    from handwriting_engine.benchmark.db import get_connection as _get_conn, samples_with_ground_truth
     from handwriting_engine.benchmark.report import generate_report
     from handwriting_engine.benchmark.lessons_bridge import feed_errors_to_lessons
 
@@ -272,6 +301,35 @@ def benchmark_run_cmd(label, providers, strategies, domain, feed_lessons, smoke,
     if preprocessing and not enhance:
         enhance = True
 
+    # --- Cost projection guardrail (FOUND-04) ---
+    # Always shown before any benchmark run. Use --yes to bypass in scripts/CI.
+    _conn = _get_conn(db_path)
+    _all_samples = samples_with_ground_truth(_conn)
+    _n_samples = len(_all_samples)
+    _avg_in, _avg_out = _get_avg_tokens_per_read(_conn)
+    _conn.close()
+
+    _prov_list_for_cost = [p.strip() for p in providers.split(",")] if providers else _available_providers()
+    _strat_list_for_cost = [s.strip() for s in strategies.split(",")] if strategies else []
+    _n_prov = len(_prov_list_for_cost)
+    _n_strat = max(1, len(_strat_list_for_cost))
+
+    # Sum cost across providers (user pays for all, not an average)
+    _total_cost = sum(
+        estimate_cost(int(_avg_in * _n_strat * _n_samples),
+                      int(_avg_out * _n_strat * _n_samples),
+                      p)
+        for p in _prov_list_for_cost
+    )
+
+    click.echo(f"Estimated cost: ${_total_cost:.3f}")
+    click.echo(f"  {_n_prov} provider{'s' if _n_prov != 1 else ''} x {_n_strat} strateg{'ies' if _n_strat != 1 else 'y'} x {_n_samples} samples")
+    click.echo("")
+    if not yes:
+        if not click.confirm("Proceed?", default=False):
+            sys.exit(0)
+    # --- End cost projection ---
+
     def progress(current, total, msg):
         click.echo(f"  [{current}/{total}] {msg}")
 
@@ -281,12 +339,15 @@ def benchmark_run_cmd(label, providers, strategies, domain, feed_lessons, smoke,
             on_progress=progress, mode=mode,
             auto_enhance=enhance, inject_lessons=inject_lessons,
             enhance_strategy=preprocessing,
+            iam_partition=iam_partition,
+            vocab_hints_off=int(vocab_hints_off),
+            db_path=db_path,
         )
     except RuntimeError as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
 
-    click.echo(generate_report(run_id))
+    click.echo(generate_report(run_id, db_path=db_path))
 
     if feed_lessons:
         count = feed_errors_to_lessons(run_id)
@@ -333,6 +394,63 @@ def benchmark_quality_cmd(run_id):
     from handwriting_engine.benchmark.report import quality_correlation
 
     click.echo(quality_correlation(run_id=run_id))
+
+
+@benchmark.command("calibrate")
+@click.option("--samples", "-n", default=20, type=int, show_default=True,
+              help="Number of random samples to use for calibration")
+@click.option("--provider", "-p", default="gemini", show_default=True,
+              help="Provider to use for calibration reads")
+@click.option("--db-path", default=None, hidden=True, help="Override DB path (for testing)")
+def benchmark_calibrate_cmd(samples, provider, db_path):
+    """Measure CER variance and minimum detectable delta on N random samples.
+
+    Runs N benchmark reads against randomly selected samples with ground truth.
+    Prints the noise floor so you know whether a measured CER delta is real.
+
+    Output: CER variance: ±0.42%  |  Min detectable delta: 0.84% (2\u03c3)
+    """
+    import random
+    import statistics as _stats
+
+    import handwriting_engine.benchmark.evaluate as _evaluate
+    from handwriting_engine.benchmark.db import get_connection, samples_with_ground_truth, get_latest_ground_truth
+    from handwriting_engine.benchmark.metrics import character_error_rate
+
+    conn = get_connection(db_path)
+    all_samples = samples_with_ground_truth(conn)
+    conn.close()
+
+    if not all_samples:
+        click.echo("No samples with ground truth in DB. Ingest some samples first.", err=True)
+        sys.exit(1)
+
+    n = min(samples, len(all_samples))
+    if n < samples:
+        click.echo(f"Warning: only {n} samples available (requested {samples})")
+
+    selected = random.sample(all_samples, n)
+
+    cers = []
+    for sample in selected:
+        result = _evaluate._read_single(sample.image_path, provider, "biology", False, False, None)
+        if result.get("error"):
+            continue
+        conn2 = get_connection(db_path)
+        gt = get_latest_ground_truth(conn2, sample.id)
+        conn2.close()
+        if gt is None:
+            continue
+        cer, _, _ = character_error_rate(result["text"], gt.text)
+        cers.append(cer)
+
+    if not cers:
+        click.echo("Not enough successful reads to compute variance (need at least 1).")
+        sys.exit(0)
+
+    sd = _stats.pstdev(cers)
+    mdd = 2 * sd
+    click.echo(f"CER variance: \u00b1{sd * 100:.2f}%  |  Min detectable delta: {mdd * 100:.2f}% (2\u03c3)")
 
 
 @benchmark.command("calibration")
