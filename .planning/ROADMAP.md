@@ -54,7 +54,13 @@ Plans:
   1. Developer runs `benchmark ingest-iam <path>` against the downloaded IAM ascii/ directory and the benchmark DB is populated with line images tagged `category="iam"` and `student="iam-writer-XXX"`, with no manual data wrangling needed.
   2. Developer runs `benchmark sweep` and the system executes all five strategies (baseline, self_correct, line_level, prompt_adapted, zoomed_verify) against the IAM test set, storing one run_id per strategy — without the developer manually invoking each strategy.
   3. `benchmark report` shows a per-writer CER breakdown table, allowing the developer to see whether a strategy's CER gain is consistent across writers or driven by a few easy writers.
-**Plans**: TBD
+**Plans**: 4 plans
+
+Plans:
+- [ ] 07-01-PLAN.md — Wave 0 RED test stubs: 16 failing tests across TestIAMIngest, TestSweep, TestPerWriterReport (IAM-01, IAM-02, IAM-03)
+- [ ] 07-02-PLAN.md — IAM ingest infrastructure: parse_iam_lines(), ingest_iam(), benchmark ingest-iam CLI (IAM-01)
+- [ ] 07-03-PLAN.md — Sweep infrastructure: line_level/auto_retry threading, run_sweep(), benchmark sweep CLI (IAM-02)
+- [ ] 07-04-PLAN.md — Per-writer report: generate_per_writer_report(), benchmark report --per-writer flag (IAM-03)
 
 ### Phase 8: Statistics Layer
 **Goal**: CER comparisons between strategies are statistically defensible — not just raw delta numbers — so the developer can assert with confidence that a measured improvement is real.
@@ -85,6 +91,6 @@ Plans:
 | 4. Preprocessing + Writer Adaptation | v2.0 | 1/1 | ✅ Complete | 2026-04-09 |
 | 5. Post-Processing + Benchmark Suite | v2.0 | 1/1 | ✅ Complete | 2026-04-09 |
 | 6. Measurement Foundation | 4/4 | Complete    | 2026-04-11 | - |
-| 7. IAM Data Ingestion + Sweep Infrastructure | v3.0 | 0/? | Not started | - |
+| 7. IAM Data Ingestion + Sweep Infrastructure | v3.0 | 0/4 | Not started | - |
 | 8. Statistics Layer | v3.0 | 0/? | Not started | - |
 | 9. Final Sweep, Recommendation, and Baseline Lock | v3.0 | 0/? | Not started | - |
