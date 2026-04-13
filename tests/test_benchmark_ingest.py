@@ -1,6 +1,7 @@
 """Tests for benchmark ingestion — image import and deduplication."""
 
 import os
+from pathlib import Path
 import pytest
 from PIL import Image
 
@@ -11,6 +12,13 @@ from handwriting_engine.benchmark.ingest import (
     ingest_single,
     _extract_page_number,
 )
+
+# IAM-specific imports — RED until Wave 1
+try:
+    from handwriting_engine.benchmark.ingest import parse_iam_lines, ingest_iam
+except ImportError:
+    parse_iam_lines = None  # type: ignore
+    ingest_iam = None  # type: ignore
 
 
 @pytest.fixture
@@ -162,3 +170,50 @@ class TestGenerateDegradedVariants:
 
         with pytest.raises(ValueError, match="not found"):
             generate_degraded_variants(999, tmp_path, db_path=db_path)
+
+
+class TestIAMIngest:
+    """RED stubs for IAM ingestion (IAM-01). All must FAIL until Wave 1."""
+
+    def test_parse_skips_comments(self):
+        pytest.fail("not implemented — parse_iam_lines must skip # comment lines")
+
+    def test_parse_filters_err(self):
+        pytest.fail("not implemented — parse_iam_lines must drop status=='err' lines")
+
+    def test_parse_extracts_fields(self):
+        pytest.fail(
+            "not implemented — parse_iam_lines must return dicts with "
+            "line_id, writer_id, form_id, transcription"
+        )
+
+    def test_parse_replaces_pipes(self):
+        pytest.fail(
+            "not implemented — parse_iam_lines must replace '|' with ' ' in transcription"
+        )
+
+    def test_parse_filters_partition(self):
+        pytest.fail(
+            "not implemented — parse_iam_lines must filter to partition_forms set when provided"
+        )
+
+    def test_ingest_sets_category_and_student(self, tmp_path):
+        pytest.fail(
+            "not implemented — ingest_iam must insert samples with "
+            "category='iam' and student='iam-writer-XXX'"
+        )
+
+    def test_ingest_inserts_ground_truth(self, tmp_path):
+        pytest.fail(
+            "not implemented — ingest_iam must call insert_ground_truth for each line"
+        )
+
+    def test_ingest_iam_dedup(self, tmp_path):
+        pytest.fail(
+            "not implemented — reimporting same ascii dir must not duplicate samples"
+        )
+
+    def test_cli_ingest_iam_command(self, tmp_path):
+        pytest.fail(
+            "not implemented — `benchmark ingest-iam <ascii_dir>` CLI command must exist"
+        )
