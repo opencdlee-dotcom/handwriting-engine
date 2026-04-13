@@ -16,7 +16,7 @@ Requirements for the benchmarking milestone. Each maps to a roadmap phase.
 
 ### IAM Benchmarking
 
-- [ ] **IAM-01**: Developer can ingest the IAM Handwriting Database line images and ground-truth transcriptions into the existing benchmark DB using `benchmark ingest-iam` (parses IAM ascii/ GT format, tags `category="iam"`, `student="iam-writer-XXX"`).
+- [x] **IAM-01**: Developer can ingest the IAM Handwriting Database line images and ground-truth transcriptions into the existing benchmark DB using `benchmark ingest-iam` (parses IAM ascii/ GT format, tags `category="iam"`, `student="iam-writer-XXX"`).
 - [ ] **IAM-02**: Developer can run a full strategy sweep with `benchmark sweep` that executes all strategies (baseline, self_correct, line_level, prompt_adapted, zoomed_verify) against the IAM test set and stores one run_id per strategy.
 - [ ] **IAM-03**: `benchmark report` can group and display per-writer CER breakdown, showing variance across writers to distinguish systematic gains from writer-specific noise.
 
@@ -60,7 +60,7 @@ Requirements for the benchmarking milestone. Each maps to a roadmap phase.
 | FOUND-02 | Phase 6 | Complete |
 | FOUND-03 | Phase 6 | Complete |
 | FOUND-04 | Phase 6 | Complete |
-| IAM-01 | Phase 7 | Pending |
+| IAM-01 | Phase 7 | Complete |
 | IAM-02 | Phase 7 | Pending |
 | IAM-03 | Phase 7 | Pending |
 | STAT-01 | Phase 8 | Pending |
