@@ -3,12 +3,12 @@ gsd_state_version: 1.0
 milestone: v3.0
 milestone_name: — Verified Accuracy
 status: unknown
-last_updated: "2026-04-11T21:16:11.811Z"
+last_updated: "2026-04-13T05:41:32.606Z"
 progress:
   total_phases: 4
   completed_phases: 1
-  total_plans: 4
-  completed_plans: 4
+  total_plans: 8
+  completed_plans: 5
 ---
 
 # Execution State
@@ -58,6 +58,7 @@ v3.0 Progress: [ 6 ][ 7 ][ 8 ][ 9 ]
 | Phase 06 P02 | 15 | 2 tasks | 3 files |
 | Phase 06 P03 | 30 | 2 tasks | 4 files |
 | Phase 06 P04 | 15 | 2 tasks | 2 files |
+| Phase 07-iam-data-ingestion-sweep-infrastructure P02 | 25 | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -77,6 +78,9 @@ v3.0 Progress: [ 6 ][ 7 ][ 8 ][ 9 ]
 - [Phase 06]: Use statistics.pstdev (not stdev) for calibrate so single-sample calibration returns 0.0 variance instead of raising StatisticsError
 - [Phase 06]: Import _read_single via module reference in calibrate command so test mocks intercept correctly
 - [Phase 06]: vocab_hints_off promoted from hardcoded 0 to proper parameter threaded from CLI through run_benchmark() to insert_run()
+- [Phase 07-02]: No quality assessment in IAM ingest — pre-segmented clean PNGs, latency without benefit
+- [Phase 07-02]: Partition safety guard at CLI layer only — ingest_iam() passes partition_forms=None and caller is responsible
+- [Phase 07-02]: ingest_iam uses autocommit=False + explicit conn.commit() per record for atomic GT+sample commits
 
 ### Key Facts for Planning
 

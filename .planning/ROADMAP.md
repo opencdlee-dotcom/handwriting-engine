@@ -91,6 +91,6 @@ Plans:
 | 4. Preprocessing + Writer Adaptation | v2.0 | 1/1 | ✅ Complete | 2026-04-09 |
 | 5. Post-Processing + Benchmark Suite | v2.0 | 1/1 | ✅ Complete | 2026-04-09 |
 | 6. Measurement Foundation | 4/4 | Complete    | 2026-04-11 | - |
-| 7. IAM Data Ingestion + Sweep Infrastructure | v3.0 | 0/4 | Not started | - |
+| 7. IAM Data Ingestion + Sweep Infrastructure | 1/4 | In Progress|  | - |
 | 8. Statistics Layer | v3.0 | 0/? | Not started | - |
 | 9. Final Sweep, Recommendation, and Baseline Lock | v3.0 | 0/? | Not started | - |
