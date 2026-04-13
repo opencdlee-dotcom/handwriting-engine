@@ -182,6 +182,68 @@ def benchmark_ingest(directory, student, category):
         click.echo(f"  [{s.id}] {s.image_path} (page {s.page_number})")
 
 
+@benchmark.command("ingest-iam")
+@click.argument("ascii_dir", type=click.Path(exists=True, file_okay=False))
+@click.option(
+    "--lines-dir", default=None, type=click.Path(file_okay=False),
+    help="Path to lines/ image directory (default: sibling of ascii/ directory)"
+)
+@click.option(
+    "--partition-file", default=None, type=click.Path(exists=True, dir_okay=False),
+    help="Text file listing form IDs to ingest (e.g. testset.txt from Aachen split)"
+)
+@click.option(
+    "--all-partitions", is_flag=True, default=False,
+    help="Ingest ALL lines regardless of partition (includes training data — use with caution)"
+)
+@click.option("--db-path", default=None, hidden=True)
+def benchmark_ingest_iam(ascii_dir, lines_dir, partition_file, all_partitions, db_path):
+    """Ingest IAM Handwriting Database line images into benchmark DB.
+
+    ASCII_DIR: path to the extracted ascii/ directory from IAM.
+    Line images are expected in a sibling lines/ directory, or use --lines-dir.
+
+    PARTITION SAFETY: Pass --partition-file testset.txt to ingest only the test split.
+    If neither --partition-file nor --all-partitions is given, this command will abort
+    to prevent accidental ingestion of training data.
+    """
+    if partition_file is None and not all_partitions:
+        click.echo(
+            "ERROR: Partition safety guard triggered.\n"
+            "  Provide --partition-file <testset.txt> to ingest only the test split, OR\n"
+            "  pass --all-partitions to ingest all lines (INCLUDES training data).\n"
+            "  Ingesting training data contaminates the benchmark — use with caution.",
+            err=True,
+        )
+        raise SystemExit(1)
+
+    if all_partitions and partition_file is None:
+        click.echo(
+            "WARNING: Ingesting ALL partitions (including training data). "
+            "This may contaminate benchmark results.",
+            err=True,
+        )
+
+    from handwriting_engine.benchmark.ingest import ingest_iam
+
+    try:
+        result = ingest_iam(
+            ascii_dir=ascii_dir,
+            lines_dir=lines_dir,
+            partition_file=partition_file,
+            db_path=db_path,
+        )
+        click.echo(
+            f"IAM ingest complete: "
+            f"{result['ingested']} ingested, "
+            f"{result['skipped_dup']} duplicates skipped, "
+            f"{result['skipped_missing']} images missing."
+        )
+    except FileNotFoundError as exc:
+        click.echo(f"ERROR: {exc}", err=True)
+        raise SystemExit(1)
+
+
 @benchmark.command("transcribe")
 @click.argument("sample_id", type=int)
 @click.option("--text", "-t", default=None, help="Ground truth transcription text")
