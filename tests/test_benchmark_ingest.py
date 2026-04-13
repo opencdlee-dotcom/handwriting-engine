@@ -1,7 +1,6 @@
 """Tests for benchmark ingestion — image import and deduplication."""
 
 import os
-from pathlib import Path
 import pytest
 from PIL import Image
 
@@ -12,13 +11,6 @@ from handwriting_engine.benchmark.ingest import (
     ingest_single,
     _extract_page_number,
 )
-
-# IAM-specific imports — RED until Wave 1
-try:
-    from handwriting_engine.benchmark.ingest import parse_iam_lines, ingest_iam
-except ImportError:
-    parse_iam_lines = None  # type: ignore
-    ingest_iam = None  # type: ignore
 
 
 @pytest.fixture
@@ -193,14 +185,14 @@ class TestIAMIngest:
             "a01-001-00 ok 120 1 300 600 20 40 HELLO WORLD\n",
             encoding="utf-8",
         )
-        # Create a fake lines/ directory with one real PNG
+        # Create a fake lines/ directory with one real PNG per line
         lines_dir = tmp_path / "lines"
         writer_dir = lines_dir / "a01"
         form_dir = writer_dir / "a01-000u"
         form_dir.mkdir(parents=True)
         img = Image.new("RGB", (200, 50), color=(240, 240, 240))
         img.save(form_dir / "a01-000u-00.png")
-        # Second line image
+        # Second line image (distinct pixels so hash differs)
         img2 = Image.new("RGB", (200, 50), color=(230, 230, 230))
         img2.save(form_dir / "a01-000u-01.png")
         return ascii_dir, lines_dir
