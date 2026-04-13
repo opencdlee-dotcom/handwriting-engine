@@ -372,6 +372,134 @@ def _box_filter_2d(arr, kernel_size: int):
     return result / (kernel_size * kernel_size)
 
 
+def parse_iam_lines(
+    lines_txt: str | Path,
+    partition_forms: set[str] | None = None,
+) -> list[dict]:
+    """Parse IAM ascii/lines.txt into a list of record dicts.
+
+    Args:
+        lines_txt: Path to the IAM lines.txt file.
+        partition_forms: If provided, only records whose form_id appears in
+            this set are included (e.g. Aachen split test set).
+
+    Returns:
+        List of dicts with keys: line_id, writer_id, form_id, transcription.
+    """
+    records: list[dict] = []
+    with open(lines_txt, encoding="utf-8") as f:
+        for raw in f:
+            line = raw.rstrip("\n")
+            # Skip comment and blank lines
+            if not line.strip() or line.startswith("#"):
+                continue
+            fields = line.split()
+            if len(fields) < 9:
+                continue
+            # Skip error-status lines
+            if fields[1] == "err":
+                continue
+            line_id = fields[0]
+            parts = line_id.split("-")
+            if len(parts) < 3:
+                continue
+            writer_id = parts[0]
+            form_id = f"{parts[0]}-{parts[1]}"
+            # Partition filtering
+            if partition_forms is not None and form_id not in partition_forms:
+                continue
+            transcription = " ".join(fields[8:]).replace("|", " ").strip()
+            records.append(
+                {
+                    "line_id": line_id,
+                    "writer_id": writer_id,
+                    "form_id": form_id,
+                    "transcription": transcription,
+                }
+            )
+    return records
+
+
+def _iam_image_path(lines_dir: str | Path, line_id: str) -> Path:
+    """Resolve the PNG path for a given IAM line ID within lines_dir."""
+    parts = line_id.split("-")
+    writer_id = parts[0]
+    form_id = f"{parts[0]}-{parts[1]}"
+    return Path(lines_dir) / writer_id / form_id / f"{line_id}.png"
+
+
+def ingest_iam(
+    ascii_dir: str | Path,
+    lines_dir: str | Path | None = None,
+    partition_file: str | Path | None = None,
+    db_path: Path | str | None = None,
+) -> dict:
+    """Ingest IAM Handwriting Database line images into the benchmark DB.
+
+    Args:
+        ascii_dir: Path to the extracted IAM ascii/ directory (must contain lines.txt).
+        lines_dir: Path to the lines/ image directory. Defaults to sibling of ascii_dir.
+        partition_file: Text file listing form IDs to ingest. If None, ingest all parsed records.
+        db_path: Override database path.
+
+    Returns:
+        Dict with keys: ingested, skipped_dup, skipped_missing.
+    """
+    ascii_dir = Path(ascii_dir)
+    lines_txt = ascii_dir / "lines.txt"
+
+    if lines_dir is None:
+        lines_dir = ascii_dir.parent / "lines"
+    lines_dir = Path(lines_dir)
+
+    if not lines_dir.exists():
+        raise FileNotFoundError(
+            f"IAM lines/ directory not found: {lines_dir}. "
+            "Pass --lines-dir to specify an alternate location."
+        )
+
+    partition_forms: set[str] | None = None
+    if partition_file is not None:
+        partition_forms = set(Path(partition_file).read_text(encoding="utf-8").split())
+
+    records = parse_iam_lines(lines_txt, partition_forms)
+
+    conn = get_connection(db_path)
+    ingested = skipped_dup = skipped_missing = 0
+    try:
+        for record in records:
+            img_path = _iam_image_path(lines_dir, record["line_id"])
+            if not img_path.exists():
+                skipped_missing += 1
+                continue
+            img_hash = hash_file(img_path)
+            if get_sample_by_hash(conn, img_hash):
+                skipped_dup += 1
+                continue
+            try:
+                sample_id = insert_sample(
+                    conn,
+                    image_path=str(img_path.resolve()),
+                    image_hash=img_hash,
+                    student=f"iam-writer-{record['writer_id']}",
+                    category="iam",
+                    source_dir=str(lines_dir.resolve()),
+                    page_number=0,
+                    notes=f"iam_line_id:{record['line_id']}",
+                    autocommit=False,
+                )
+                insert_ground_truth(conn, sample_id, record["transcription"], source="iam_ascii")
+                conn.commit()
+                ingested += 1
+            except sqlite3.IntegrityError:
+                conn.rollback()
+                skipped_dup += 1
+    finally:
+        conn.close()
+
+    return {"ingested": ingested, "skipped_dup": skipped_dup, "skipped_missing": skipped_missing}
+
+
 def bootstrap_ground_truth(
     db_path: Path | str | None = None,
     agreement_threshold: float = 0.02,
