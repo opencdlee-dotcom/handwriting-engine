@@ -2,11 +2,11 @@
   "mcpServers": {
     "raphael": {
       "command": "node",
-      "args": ["/Users/user/Documents/VSCode Projects/Raphael/engine/dist/bridge/mcp-server.js"]
+      "args": ["/Users/user/Documents/Work & Projects/VSCode Projects/claude-ecosystem/Raphael/engine/dist/bridge/mcp-server.js"]
     },
     "filesystem": {
       "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/user/Documents/VSCode Projects/handwriting-engine"]
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/user/Documents/Work & Projects/VSCode Projects/handwriting-engine"]
     }
   }
 }

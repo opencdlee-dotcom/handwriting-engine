@@ -22,9 +22,24 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-import cv2
-import numpy as np
+try:
+    import cv2  # type: ignore
+    import numpy as np  # type: ignore
+    _HAS_CV2 = True
+except ImportError:
+    cv2 = None  # type: ignore
+    np = None  # type: ignore
+    _HAS_CV2 = False
+
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageStat
+
+
+def _require_cv2(func_name: str) -> None:
+    if not _HAS_CV2:
+        raise ImportError(
+            f"{func_name} requires opencv-python and numpy. "
+            "Install with: pip install opencv-python numpy"
+        )
 
 from handwriting_engine._constants import (
     CRISP_PRESETS,
@@ -470,6 +485,7 @@ def clahe_enhance(
         Grid size for local histogram regions.  8 for full pages, 4 for
         narrow crops like name fields.
     """
+    _require_cv2("clahe_enhance")
     img = Image.open(image_path)
     img_rgb, alpha = _strip_alpha(img)
 
@@ -511,6 +527,7 @@ def sauvola_enhance(
 
     Falls back to clahe_enhance() if scikit-image is not installed.
     """
+    _require_cv2("sauvola_enhance")
     try:
         from skimage.filters import threshold_sauvola
     except ImportError:
@@ -555,6 +572,7 @@ def remove_horizontal_lines(
         Minimum fraction of page width for a structure to count as a
         ruling line.  Default 0.5 safely preserves letter crossbars.
     """
+    _require_cv2("remove_horizontal_lines")
     img = Image.open(image_path)
     img_rgb, alpha = _strip_alpha(img)
 
