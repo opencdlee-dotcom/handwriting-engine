@@ -7,7 +7,7 @@ from handwriting_engine.providers.cache import VisionCache
 
 @pytest.fixture
 def cache(tmp_path):
-    return VisionCache(cache_dir=tmp_path / "cache")
+    return VisionCache(cache_dir=tmp_path / "cache", enabled=True)
 
 
 class TestVisionCache:

@@ -149,11 +149,15 @@ def preprocess_crop(img: Image.Image) -> Image.Image:
         enhanced = enhancer.enhance(1.4)
         result = enhanced.convert("RGB")
 
-    # Ensure minimum height for downstream readability
+    # Ensure minimum height for downstream readability. LANCZOS upscale adds no
+    # information and inflates image tokens sent to vision providers — pad the
+    # canvas with white instead so the vision model sees the original pixels.
     w, h = result.size
     if h < CROP_MIN_HEIGHT:
-        scale = CROP_MIN_HEIGHT / h
-        result = result.resize((int(w * scale), CROP_MIN_HEIGHT), Image.LANCZOS)
+        padded = Image.new("RGB", (w, CROP_MIN_HEIGHT), color=(255, 255, 255))
+        y_offset = (CROP_MIN_HEIGHT - h) // 2
+        padded.paste(result, (0, y_offset))
+        result = padded
 
     return result
 

@@ -339,8 +339,9 @@ def _get_avg_tokens_per_read(conn) -> tuple:
 @click.option("--yes", "-y", is_flag=True, help="Skip cost confirmation prompt (CI-friendly)")
 @click.option("--iam-partition", default=None, help="IAM partition label for provenance (e.g. 'test2023')")
 @click.option("--vocab-hints-off", is_flag=True, help="Record that vocabulary hints were disabled for this run")
+@click.option("--force-rerun", is_flag=True, help="Re-read every sample even if a prior run has matching results (default: reuse prior outputs when model_version matches)")
 @click.option("--db-path", default=None, hidden=True, help="Override DB path (for testing)")
-def benchmark_run_cmd(label, providers, strategies, domain, feed_lessons, smoke, enhance, inject_lessons, compare_strategies, preprocessing, yes, iam_partition, vocab_hints_off, db_path):
+def benchmark_run_cmd(label, providers, strategies, domain, feed_lessons, smoke, enhance, inject_lessons, compare_strategies, preprocessing, yes, iam_partition, vocab_hints_off, force_rerun, db_path):
     """Run all providers/strategies against samples with ground truth.
 
     Only samples that have ground-truth transcriptions are evaluated.
@@ -403,6 +404,7 @@ def benchmark_run_cmd(label, providers, strategies, domain, feed_lessons, smoke,
             enhance_strategy=preprocessing,
             iam_partition=iam_partition,
             vocab_hints_off=int(vocab_hints_off),
+            skip_existing=not force_rerun,
             db_path=db_path,
         )
     except RuntimeError as e:

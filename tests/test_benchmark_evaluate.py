@@ -453,14 +453,14 @@ class TestCompareRuns:
             "confidence": 0.7, "latency_ms": 500,
             "input_tokens": 100, "output_tokens": 50, "error": None,
         }
-        run_benchmark(providers=["gemini"], strategies=[], db_path=seeded_db)
+        run_benchmark(providers=["gemini"], strategies=[], db_path=seeded_db, skip_existing=False)
 
         mock_read.return_value = {
             "text": "completely wrong garbage text output",
             "confidence": 0.3, "latency_ms": 800,
             "input_tokens": 100, "output_tokens": 50, "error": None,
         }
-        run_benchmark(providers=["gemini"], strategies=[], db_path=seeded_db)
+        run_benchmark(providers=["gemini"], strategies=[], db_path=seeded_db, skip_existing=False)
 
         regs = detect_regressions(db_path=seeded_db)
         assert len(regs) > 0

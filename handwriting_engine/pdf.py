@@ -199,8 +199,11 @@ def cleanup_images(output_dir: str):
 
 def _enhance_page(image_path: str, jpeg_quality: int) -> None:
     """Apply light sharpening and contrast boost to a page image in place."""
+    from handwriting_engine.enhance import mark_enhanced
+
     img = Image.open(image_path)
     img = ImageEnhance.Sharpness(img).enhance(1.3)
     img = ImageEnhance.Contrast(img).enhance(1.2)
     img.save(image_path, "JPEG", quality=jpeg_quality)
     img.close()
+    mark_enhanced(image_path)

@@ -34,6 +34,25 @@ except ImportError:
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageStat
 
 
+# Track paths that have already been enhanced in this process so downstream
+# passes can skip redundant work (e.g. PDF rasterization enhances, then
+# vision.read_page() would otherwise enhance again).
+_HE_ENHANCED_PATHS: set[str] = set()
+
+
+def mark_enhanced(path: str) -> None:
+    """Record that `path` has already been enhanced in this process."""
+    if path:
+        _HE_ENHANCED_PATHS.add(os.path.abspath(path))
+
+
+def was_enhanced(path: str) -> bool:
+    """Check whether `path` has been enhanced in this process."""
+    if not path:
+        return False
+    return os.path.abspath(path) in _HE_ENHANCED_PATHS
+
+
 def _require_cv2(func_name: str) -> None:
     if not _HAS_CV2:
         raise ImportError(
@@ -635,36 +654,31 @@ def enhance_image(
         If *strategy* is not recognised.
     """
     if strategy == "smart":
-        return smart_enhance(image_path, output_path=output_path)
-
-    if strategy == "adaptive":
-        return adaptive_enhance(image_path, output_path=output_path)
-
-    if strategy == "proven":
-        return proven_enhance(image_path, output_path=output_path)
-
-    if strategy == "llm":
-        return llm_enhance(image_path, output_path=output_path)
-
-    if strategy == "clahe":
-        return clahe_enhance(image_path, output_path=output_path)
-
-    if strategy in ("light", "medium", "heavy"):
-        return crisp(image_path, strength=strategy, output_path=output_path)
-
-    if strategy == "full":
-        # Force a full-pass enhancement regardless of assessment
+        result = smart_enhance(image_path, output_path=output_path)
+    elif strategy == "adaptive":
+        result = adaptive_enhance(image_path, output_path=output_path)
+    elif strategy == "proven":
+        result = proven_enhance(image_path, output_path=output_path)
+    elif strategy == "llm":
+        result = llm_enhance(image_path, output_path=output_path)
+    elif strategy == "clahe":
+        result = clahe_enhance(image_path, output_path=output_path)
+    elif strategy in ("light", "medium", "heavy"):
+        result = crisp(image_path, strength=strategy, output_path=output_path)
+    elif strategy == "full":
         forced_assessment = {
             "quality": "poor",
             "recommended_strategy": "full",
             "faint_ink": False,
         }
-        return smart_enhance(image_path, assessment=forced_assessment, output_path=output_path)
+        result = smart_enhance(image_path, assessment=forced_assessment, output_path=output_path)
+    elif strategy == "sauvola":
+        result = sauvola_enhance(image_path, output_path=output_path)
+    else:
+        raise ValueError(
+            f"Unknown enhancement strategy {strategy!r}. "
+            f"Choose from: smart, adaptive, proven, llm, clahe, sauvola, light, medium, heavy, full"
+        )
 
-    if strategy == "sauvola":
-        return sauvola_enhance(image_path, output_path=output_path)
-
-    raise ValueError(
-        f"Unknown enhancement strategy {strategy!r}. "
-        f"Choose from: smart, adaptive, proven, llm, clahe, sauvola, light, medium, heavy, full"
-    )
+    mark_enhanced(result)
+    return result

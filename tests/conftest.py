@@ -1,6 +1,11 @@
 """Shared test fixtures for handwriting engine tests."""
 
 import os
+
+# Disable the persistent vision cache in tests. Mocked providers would otherwise
+# get shadowed by earlier real cached outputs, producing flaky cross-run behavior.
+os.environ.setdefault("HE_CACHE_ENABLED", "0")
+
 import tempfile
 import pytest
 from PIL import Image

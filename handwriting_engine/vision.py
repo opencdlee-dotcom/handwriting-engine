@@ -14,7 +14,7 @@ import re
 
 from PIL import Image
 
-from handwriting_engine._constants import MAX_IMAGE_LONG_SIDE, JPEG_QUALITY
+from handwriting_engine._constants import MAX_IMAGE_LONG_SIDE, JPEG_QUALITY, MAX_TOKENS_SINGLE
 from handwriting_engine.providers import get_provider, available_providers
 from handwriting_engine.providers.base import ConsensusResult
 
@@ -148,22 +148,21 @@ def _dual_polarity_read(
 
     Faint pencil strokes invisible on white paper pop against a dark background
     in the inverted version. The LLM's vision encoder activates different feature
-    channels on inverted images. Returns the cleaner result or a merged version.
+    channels on inverted images. Runs both reads concurrently and returns the
+    cleaner result (fewer uncertainty markers).
     """
     import io
     import base64
+    import concurrent.futures
     from PIL import ImageOps
+    from handwriting_engine.providers.cache import cached_read_image
 
-    # Normal read
-    normal_text = provider_obj.read_image(b64_data, media_type, prompt, system_prompt, max_tokens)
-
-    # Create inverted image
+    # Build inverted image up front so both calls can fire in parallel
+    inv_b64 = None
     try:
         img = Image.open(image_path)
         img.load()
-        if img.mode == "RGBA":
-            img = img.convert("RGB")
-        elif img.mode != "RGB":
+        if img.mode != "RGB":
             img = img.convert("RGB")
         inverted = ImageOps.invert(img)
         buf = io.BytesIO()
@@ -173,18 +172,40 @@ def _dual_polarity_read(
         img.close()
     except Exception as e:
         logger.warning("Dual-polarity inversion failed: %s", e)
-        return normal_text
 
     inv_prompt = (
         "This is a color-inverted version of handwritten text (dark background, light text). "
         "Read all text carefully, focusing on faint characters that may be more visible "
         "in this inverted view. " + prompt
     )
-    try:
-        inverted_text = provider_obj.read_image(inv_b64, "image/jpeg", inv_prompt, system_prompt, max_tokens)
-    except Exception as e:
-        logger.warning("Dual-polarity inverted read failed: %s", e)
-        return normal_text
+
+    # Submit both reads concurrently. If inversion failed, run only the normal read.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        fut_normal = pool.submit(
+            cached_read_image, provider_obj, b64_data, media_type, prompt, system_prompt, max_tokens,
+        )
+        fut_inverted = (
+            pool.submit(
+                cached_read_image, provider_obj, inv_b64, "image/jpeg", inv_prompt, system_prompt, max_tokens,
+            )
+            if inv_b64 is not None
+            else None
+        )
+
+        try:
+            normal_text = fut_normal.result()
+        except Exception as e:
+            logger.warning("Dual-polarity normal read failed: %s", e)
+            normal_text = ""
+
+        if fut_inverted is None:
+            return normal_text
+
+        try:
+            inverted_text = fut_inverted.result()
+        except Exception as e:
+            logger.warning("Dual-polarity inverted read failed: %s", e)
+            return normal_text
 
     # Pick the cleaner result (fewer uncertainty markers)
     marker_re = re.compile(r"\[\?\]|\?\?\?|\[illegible[^\]]*\]", re.IGNORECASE)
@@ -204,7 +225,7 @@ def read_page(
     domain: str = "biology",
     provider: str = "claude",
     system_prompt: str = "",
-    max_tokens: int = 4096,
+    max_tokens: int = MAX_TOKENS_SINGLE,
     inject_strategies: bool = True,
     auto_enhance: bool = False,
     inject_lessons: bool = True,
@@ -244,9 +265,9 @@ def read_page(
     if auto_enhance:
         import tempfile
         from handwriting_engine.quality import assess_image
-        from handwriting_engine.enhance import enhance_image
+        from handwriting_engine.enhance import enhance_image, was_enhanced
         assessment = assess_image(image_path)
-        if assessment["quality"] != "good":
+        if assessment["quality"] != "good" and not was_enhanced(image_path):
             # Use proven for faint/poor (15-20% CER improvement), adaptive for fair
             if assessment.get("faint_ink") or assessment["quality"] == "poor":
                 strategy = "proven"
@@ -350,10 +371,11 @@ def read_page(
 
     # Dual-polarity reading for faint ink: send both normal and inverted images
     from handwriting_engine._constants import DUAL_POLARITY_ENABLED
+    from handwriting_engine.providers.cache import cached_read_image
     if DUAL_POLARITY_ENABLED and assessment and assessment.get("faint_ink"):
         raw = _dual_polarity_read(image_path, b64_data, media_type, p, prompt, system_prompt, max_tokens)
     else:
-        raw = p.read_image(b64_data, media_type, prompt, system_prompt, max_tokens)
+        raw = cached_read_image(p, b64_data, media_type, prompt, system_prompt, max_tokens)
 
     if postprocess:
         raw = _postprocess_output(raw, domain=domain)
@@ -396,7 +418,7 @@ def _zoomed_verify(
     text: str,
     provider: str,
     system_prompt: str,
-    max_tokens: int = 4096,
+    max_tokens: int = MAX_TOKENS_SINGLE,
 ) -> str:
     """Re-read uncertain regions at higher resolution to resolve [?] markers.
 

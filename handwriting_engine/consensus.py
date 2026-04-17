@@ -13,8 +13,10 @@ import logging
 import re
 from difflib import SequenceMatcher
 
+from handwriting_engine._constants import MAX_TOKENS_SINGLE
 from handwriting_engine.providers import get_provider, available_providers
 from handwriting_engine.providers.base import ConsensusResult, circuit_breaker
+from handwriting_engine.providers.cache import cached_read_image
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +72,7 @@ def read_with_consensus(
     strategy: str = "vote",
     confidence_threshold: float = 0.8,
     content_type: str = "default",
-    max_tokens: int = 4096,
+    max_tokens: int = MAX_TOKENS_SINGLE,
     max_debate_rounds: int = 2,
     quality_assessment: dict | None = None,
     max_self_correct_rounds: int = 1,
@@ -144,7 +146,7 @@ def _best_of(
             continue
         try:
             provider = get_provider(candidate_name)
-            text = provider.read_image(image_b64, media_type, prompt, system_prompt, max_tokens)
+            text = cached_read_image(provider, image_b64, media_type, prompt, system_prompt, max_tokens)
             used_provider = candidate_name
             circuit_breaker.record_success(candidate_name)
             break
@@ -203,7 +205,7 @@ def _self_correct(
 
     try:
         provider = get_provider(provider_name)
-        initial_text = provider.read_image(image_b64, media_type, prompt, system_prompt, max_tokens)
+        initial_text = cached_read_image(provider, image_b64, media_type, prompt, system_prompt, max_tokens)
         circuit_breaker.record_success(provider_name)
     except Exception as e:
         logger.warning(f"self_correct: initial read failed for {provider_name}: {e}")
@@ -223,8 +225,8 @@ def _self_correct(
         )
 
         try:
-            corrected_text = provider.read_image(
-                image_b64, media_type, correction_prompt, system_prompt, max_tokens
+            corrected_text = cached_read_image(
+                provider, image_b64, media_type, correction_prompt, system_prompt, max_tokens,
             )
             rounds_done += 1
             circuit_breaker.record_success(provider_name)
@@ -257,7 +259,7 @@ def _self_correct(
 def _vote(
     image_b64: str, media_type: str, prompt: str, system_prompt: str,
     providers: list[str] | None, confidence_threshold: float,
-    content_type: str = "default", max_tokens: int = 4096,
+    content_type: str = "default", max_tokens: int = MAX_TOKENS_SINGLE,
 ) -> ConsensusResult:
     """Send to N providers, word-level majority vote.
 
@@ -279,7 +281,7 @@ def _vote(
         )
     if len(providers) < 2:
         p = get_provider(providers[0])
-        text = p.read_image(image_b64, media_type, prompt, system_prompt, max_tokens)
+        text = cached_read_image(p, image_b64, media_type, prompt, system_prompt, max_tokens)
         conf = _single_text_confidence(text)
         return ConsensusResult(
             text=text,
@@ -298,7 +300,7 @@ def _vote(
             return name, "", {}, None
         try:
             p = get_provider(name)
-            text = p.read_image(image_b64, media_type, prompt, system_prompt, max_tokens)
+            text = cached_read_image(p, image_b64, media_type, prompt, system_prompt, max_tokens)
             circuit_breaker.record_success(name)
             return name, text, p.usage, p
         except Exception as e:
@@ -452,7 +454,7 @@ def _debate(
             return ConsensusResult(text="", confidence=0.0, strategy_used="debate_failed")
         try:
             proposer = get_provider(candidate)
-            initial_read = proposer.read_image(image_b64, media_type, prompt, system_prompt, max_tokens)
+            initial_read = cached_read_image(proposer, image_b64, media_type, prompt, system_prompt, max_tokens)
             circuit_breaker.record_success(candidate)
             conf = _single_text_confidence(initial_read)
             return ConsensusResult(
@@ -476,7 +478,7 @@ def _debate(
             return candidate, "", None
         try:
             p = get_provider(candidate)
-            text = p.read_image(image_b64, media_type, prompt, system_prompt, max_tokens)
+            text = cached_read_image(p, image_b64, media_type, prompt, system_prompt, max_tokens)
             circuit_breaker.record_success(candidate)
             return candidate, text, p
         except Exception as e:
@@ -573,7 +575,7 @@ def _debate(
             except Exception:
                 continue
 
-    final = resolver.read_image(image_b64, media_type, resolve_prompt, system_prompt, max_tokens)
+    final = cached_read_image(resolver, image_b64, media_type, resolve_prompt, system_prompt, max_tokens)
     used_providers = {proposer_name, critic_name, resolver_name}
     strategy_used = "debate_resolved"
 
@@ -595,7 +597,7 @@ def _debate(
             )
             try:
                 ice_provider = get_provider(ice_candidates[0])
-                ice_result = ice_provider.read_image(image_b64, media_type, ice_prompt, system_prompt, max_tokens)
+                ice_result = cached_read_image(ice_provider, image_b64, media_type, ice_prompt, system_prompt, max_tokens)
                 if ice_result.strip():
                     # Only accept if it reduced uncertainty markers
                     new_markers = len(_UNCERTAINTY_RE.findall(ice_result))
@@ -666,7 +668,7 @@ def _cascade(
             continue
         try:
             provider = get_provider(provider_name)
-            text = provider.read_image(image_b64, media_type, prompt, system_prompt, max_tokens)
+            text = cached_read_image(provider, image_b64, media_type, prompt, system_prompt, max_tokens)
             all_results[provider_name] = text
             circuit_breaker.record_success(provider_name)
 

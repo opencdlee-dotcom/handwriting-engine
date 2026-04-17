@@ -498,3 +498,35 @@ def get_latest_run_id(conn: sqlite3.Connection) -> int | None:
     """Get the most recent run ID."""
     row = conn.execute("SELECT id FROM runs ORDER BY id DESC LIMIT 1").fetchone()
     return row["id"] if row else None
+
+
+def find_reusable_output(
+    conn: sqlite3.Connection,
+    sample_id: int,
+    provider: str,
+    strategy: str,
+    model_version: str | None,
+) -> sqlite3.Row | None:
+    """Find the most recent successful provider_output + metric row that can be reused.
+
+    Matches on (sample_id, provider, strategy) and, when available, the run's
+    model_version. Returns the joined row or None if no reusable output exists.
+    Only returns rows whose run succeeded (error IS NULL) and has CER metrics.
+    """
+    params: list = [sample_id, provider, strategy]
+    sql = (
+        "SELECT po.output_text, po.confidence, po.latency_ms, "
+        "po.input_tokens, po.output_tokens, po.question_marker_rate, "
+        "em.cer, em.wer, em.char_edits, em.word_edits, em.ref_chars, em.ref_words, "
+        "em.ground_truth_id "
+        "FROM provider_outputs po "
+        "JOIN eval_metrics em ON em.provider_output_id = po.id "
+        "JOIN runs r ON r.id = po.run_id "
+        "WHERE po.sample_id = ? AND po.provider = ? AND po.strategy = ? "
+        "AND po.error IS NULL "
+    )
+    if model_version:
+        sql += "AND r.model_version = ? "
+        params.append(model_version)
+    sql += "ORDER BY po.id DESC LIMIT 1"
+    return conn.execute(sql, params).fetchone()

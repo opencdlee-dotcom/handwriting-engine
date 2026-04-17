@@ -59,6 +59,9 @@ class GeminiProvider:
         # Context cache for batch workflows (90% discount on cached tokens)
         self._cached_content_name: str | None = None
         self._cached_system_prompt: str | None = None
+        # Track per-prompt call count so we can auto-enable context caching
+        # on the 2nd+ call with the same system prompt (first call has no cache to amortize).
+        self._system_prompt_calls: dict[str, int] = {}
 
     def _retryable_exceptions(self) -> tuple:
         from google.api_core.exceptions import ResourceExhausted, ServiceUnavailable, InternalServerError
@@ -91,6 +94,32 @@ class GeminiProvider:
             logger.warning("Context caching failed (will use inline): %s", e)
             self._cached_content_name = None
             self._cached_system_prompt = None
+
+    def _maybe_auto_enable_context_cache(self, system_prompt: str) -> None:
+        """Auto-enable Gemini context cache on the 2nd+ call with the same long system prompt.
+
+        Gemini Flash requires 1024+ cached tokens (~4096 chars), Pro requires 4096+ tokens
+        (~16384 chars). Creating a cache has fixed overhead, so we wait until the 2nd call
+        with the same prompt to amortize the setup cost. Cached calls get a 90% input-token
+        discount.
+        """
+        if not system_prompt:
+            return
+        # Skip if already cached for this exact prompt
+        if self._cached_content_name and self._cached_system_prompt == system_prompt:
+            return
+        is_flash = "flash" in self._model.lower()
+        min_chars = 4096 if is_flash else 16384
+        if len(system_prompt) < min_chars:
+            return
+        # Count calls per prompt; enable cache starting on the 2nd identical call
+        count = self._system_prompt_calls.get(system_prompt, 0) + 1
+        self._system_prompt_calls[system_prompt] = count
+        # Prune the counter to avoid unbounded growth
+        if len(self._system_prompt_calls) > 8:
+            self._system_prompt_calls = {system_prompt: count}
+        if count >= 2:
+            self.enable_context_cache(system_prompt)
 
     def invalidate_cache(self) -> None:
         """Clear the context cache."""
@@ -135,6 +164,7 @@ class GeminiProvider:
         image_bytes = base64.b64decode(image_b64)
         image_part = types.Part.from_bytes(data=image_bytes, mime_type=media_type)
 
+        self._maybe_auto_enable_context_cache(system_prompt)
         config = self._build_config(max_tokens, system_instruction=system_prompt)
 
         def _call():
@@ -176,6 +206,7 @@ class GeminiProvider:
                     parts.append(block["text"])
 
         parts.append(prompt)
+        self._maybe_auto_enable_context_cache(system_prompt)
         config = self._build_config(max_tokens, system_instruction=system_prompt)
 
         def _call():
@@ -216,6 +247,7 @@ class GeminiProvider:
                     parts.append(block["text"])
 
         parts.append(prompt)
+        self._maybe_auto_enable_context_cache(system_prompt)
         config = self._build_config(
             max_tokens,
             system_instruction=system_prompt,

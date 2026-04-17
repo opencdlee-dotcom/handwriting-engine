@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Callable
 
 from handwriting_engine.benchmark.db import (
+    find_reusable_output,
     finish_run,
     get_connection,
     get_latest_ground_truth,
@@ -217,6 +218,7 @@ def run_benchmark(
     iam_partition: str | None = None,
     vocabulary_hints: list[str] | None = None,
     vocab_hints_off: int = 0,
+    skip_existing: bool = True,
 ) -> int:
     """Execute a full benchmark run.
 
@@ -252,6 +254,7 @@ def run_benchmark(
             iam_partition=iam_partition,
             vocabulary_hints=vocabulary_hints,
             vocab_hints_off=vocab_hints_off,
+            skip_existing=skip_existing,
         )
     finally:
         conn.close()
@@ -272,6 +275,7 @@ def _run_benchmark_inner(
     iam_partition: str | None = None,
     vocabulary_hints: list[str] | None = None,
     vocab_hints_off: int = 0,
+    skip_existing: bool = True,
 ) -> int:
     """Inner benchmark logic with connection managed by caller."""
     # Resolve providers
@@ -317,6 +321,38 @@ def _run_benchmark_inner(
 
     evaluated = 0
     total = len(samples)
+    model_version_label = _resolve_model_version(providers)
+    reused_count = 0
+
+    def _copy_reusable(provider_label: str, strategy_label: str, row, gt_id: int) -> bool:
+        """Insert cached row into current run. Returns True if a row was reused."""
+        if row is None:
+            return False
+        po_id = insert_provider_output(
+            conn,
+            run_id=run_id,
+            sample_id=sample.id,
+            provider=provider_label,
+            strategy=strategy_label,
+            output_text=row["output_text"],
+            confidence=row["confidence"] or 0.0,
+            latency_ms=row["latency_ms"] or 0,
+            input_tokens=row["input_tokens"] or 0,
+            output_tokens=row["output_tokens"] or 0,
+            error=None,
+            question_marker_rate=row["question_marker_rate"],
+            autocommit=False,
+        )
+        insert_eval_metric(
+            conn, po_id, gt_id,
+            cer=row["cer"], wer=row["wer"],
+            char_edits=row["char_edits"] or 0,
+            word_edits=row["word_edits"] or 0,
+            ref_chars=row["ref_chars"] or 0,
+            ref_words=row["ref_words"] or 0,
+            autocommit=False,
+        )
+        return True
 
     for i, sample in enumerate(samples):
         gt = get_latest_ground_truth(conn, sample.id)
@@ -332,6 +368,11 @@ def _run_benchmark_inner(
 
         # Single-provider reads
         for provider in providers:
+            if skip_existing:
+                cached = find_reusable_output(conn, sample.id, provider, "single", model_version_label)
+                if _copy_reusable(provider, "single", cached, gt.id):
+                    reused_count += 1
+                    continue
             result = _read_single(sample.image_path, provider, domain, auto_enhance, inject_lessons, enhance_strategy)
             # Compute marker rate from raw text BEFORE any normalization
             raw_text = result["text"]
@@ -366,8 +407,13 @@ def _run_benchmark_inner(
         # Consensus strategies (need 2+ providers)
         if len(providers) >= 2:
             for strategy in strategies:
-                result = _read_consensus(sample.image_path, providers, strategy, domain)
                 provider_label = "+".join(providers)
+                if skip_existing:
+                    cached = find_reusable_output(conn, sample.id, provider_label, strategy, model_version_label)
+                    if _copy_reusable(provider_label, strategy, cached, gt.id):
+                        reused_count += 1
+                        continue
+                result = _read_consensus(sample.image_path, providers, strategy, domain)
                 # Compute marker rate from RAW text BEFORE character_error_rate() normalizes it
                 # CRITICAL: normalize_text() in metrics.py strips [?] — must capture here
                 raw_text = result["text"]
@@ -404,7 +450,11 @@ def _run_benchmark_inner(
         evaluated += 1
 
     finish_run(conn, run_id, evaluated)
-    logger.info("Benchmark run %d complete: %d samples evaluated", run_id, evaluated)
+    if reused_count:
+        logger.info("Benchmark run %d complete: %d samples evaluated (%d rows reused from prior runs)",
+                    run_id, evaluated, reused_count)
+    else:
+        logger.info("Benchmark run %d complete: %d samples evaluated", run_id, evaluated)
     return run_id
 
 

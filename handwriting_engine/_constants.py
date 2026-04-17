@@ -93,6 +93,13 @@ VOCAB_PRIMING_MAX_TOKENS = 200
 # Dual-polarity reading — inverted images for faint ink detection
 DUAL_POLARITY_ENABLED = True
 
+# max_tokens defaults — typical handwriting OCR outputs are 500–1,500 tokens.
+# Prior defaults (4096 single, 8192 batch) left large headroom that bills against
+# Anthropic's reserved allocation and doesn't help accuracy. Callers can still
+# override via the `max_tokens` parameter for long-output edge cases.
+MAX_TOKENS_SINGLE = 2048
+MAX_TOKENS_BATCH = 4096
+
 # API timeout (seconds) — prevents hanging calls from blocking the pipeline
 API_TIMEOUT_SECONDS = 120
 

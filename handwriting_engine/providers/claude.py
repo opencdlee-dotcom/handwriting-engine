@@ -85,7 +85,7 @@ class ClaudeProvider:
         }
         if system_prompt:
             # Enable prompt caching for long system prompts (same as _call)
-            if len(system_prompt) > 4096:
+            if len(system_prompt) > 2048:
                 kwargs["system"] = [
                     {
                         "type": "text",
@@ -118,7 +118,7 @@ class ClaudeProvider:
                 if system_prompt:
                     # Enable prompt caching for long system prompts (>1024 tokens ≈ 4096 chars)
                     # Saves up to 90% on repeated calls with same handwriting rules
-                    if len(system_prompt) > 4096:
+                    if len(system_prompt) > 2048:
                         kwargs["system"] = [
                             {
                                 "type": "text",
