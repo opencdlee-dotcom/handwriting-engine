@@ -17,6 +17,17 @@ from handwriting_engine.benchmark.report import (
     detect_regressions,
 )
 
+# Sweep + report imports — RED until Wave 2
+try:
+    from handwriting_engine.benchmark.evaluate import run_sweep
+except ImportError:
+    run_sweep = None  # type: ignore
+
+try:
+    from handwriting_engine.benchmark.report import generate_per_writer_report
+except ImportError:
+    generate_per_writer_report = None  # type: ignore
+
 
 @pytest.fixture
 def db_path(tmp_path):
@@ -454,3 +465,59 @@ class TestCompareRuns:
         regs = detect_regressions(db_path=seeded_db)
         assert len(regs) > 0
         assert regs[0]["delta"] > 0
+
+
+class TestSweep:
+    """RED stubs for sweep infrastructure (IAM-02). All must FAIL until Wave 2."""
+
+    def test_run_benchmark_accepts_line_level(self, seeded_db):
+        pytest.fail(
+            "not implemented — run_benchmark must accept line_level=True "
+            "and thread it through to _read_single"
+        )
+
+    def test_run_benchmark_accepts_auto_retry(self, seeded_db):
+        pytest.fail(
+            "not implemented — run_benchmark must accept auto_retry=True "
+            "and thread it through to _read_single"
+        )
+
+    def test_run_sweep_returns_five_run_ids(self, seeded_db):
+        pytest.fail(
+            "not implemented — run_sweep must return a dict with exactly 5 keys: "
+            "baseline, self_correct, line_level, prompt_adapted, zoomed_verify"
+        )
+
+    def test_sweep_cli_shows_cost(self, tmp_path):
+        pytest.fail(
+            "not implemented — `benchmark sweep` CLI must print projected cost "
+            "before any API call (even with no real samples)"
+        )
+
+    def test_sweep_cli_yes_executes(self, tmp_path):
+        pytest.fail(
+            "not implemented — `benchmark sweep --yes` must bypass cost confirmation "
+            "and attempt to execute all 5 strategies"
+        )
+
+
+class TestPerWriterReport:
+    """RED stubs for per-writer report (IAM-03). All must FAIL until Wave 2."""
+
+    def test_per_writer_report_groups_by_student(self, seeded_db):
+        pytest.fail(
+            "not implemented — generate_per_writer_report must group CER by "
+            "samples.student and return a formatted table string"
+        )
+
+    def test_per_writer_report_no_writers(self, seeded_db):
+        pytest.fail(
+            "not implemented — generate_per_writer_report on run with no student "
+            "data must return a message indicating no writer data available"
+        )
+
+    def test_report_cli_per_writer_flag(self, tmp_path):
+        pytest.fail(
+            "not implemented — `benchmark report --per-writer` CLI flag must exist "
+            "and invoke generate_per_writer_report"
+        )
