@@ -2,7 +2,7 @@
   "mcpServers": {
     "raphael": {
       "command": "node",
-      "args": ["~/Documents/Work & Projects/VSCode Projects/claude-ecosystem/Raphael/engine/dist/bridge/mcp-server.js"]
+      "args": ["~/Documents/Work & Projects/VSCode Projects/claude/Raphael/engine/dist/bridge/mcp-server.js"]
     },
     "filesystem": {
       "command": "npx",
