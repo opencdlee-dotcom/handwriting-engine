@@ -14,9 +14,18 @@ from __future__ import annotations
 import os
 import re
 import logging
+from dataclasses import dataclass
 from functools import lru_cache
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class Correction:
+    """A single confusion-pair correction applied during postprocessing."""
+    original: str
+    corrected: str
+    pair: str  # e.g. "I↔l" — the confusion-pair label that triggered the swap
 
 
 def _trained_corrector_enabled(explicit: bool | None) -> bool:
@@ -440,6 +449,111 @@ def correct_domain_terms(text: str, domain: str = "biology") -> str:
     return " ".join(corrected)
 
 
+def _confusion_postprocess_enabled() -> bool:
+    """HE_CONFUSION_POSTPROCESS env flag — default ON; set 0 to disable."""
+    val = os.environ.get("HE_CONFUSION_POSTPROCESS")
+    if val is None:
+        return True
+    return val.strip().lower() not in ("0", "false", "no", "off")
+
+
+def correct_confusion_pairs(
+    text: str,
+    *,
+    domain: str = "biology",
+    writer_id: str | None = None,
+    db_path=None,
+) -> tuple[str, list[Correction]]:
+    """Confusion-pair-aware single-word swap.
+
+    For each word that is NOT in the domain wordlist, try swapping a single
+    confusion-pair occurrence (`I→l`, `rn→m`, `cl→d`, `0→O`, …). If exactly
+    one candidate produced by such a swap is in the wordlist, prefer the swap
+    and record a Correction.
+
+    Higher-precision than the existing edit-distance-1 pass: only swaps that
+    correspond to known confusion pairs are considered, and only when the
+    resulting word is unambiguously a domain term.
+
+    Args:
+        text: Transcription text to correct.
+        domain: One of 'biology', 'chemistry', 'general', 'science'.
+        writer_id: Optional writer ID. Reserved for per-writer biasing once
+            S4's corrections table is populated; today the engine falls back
+            to global confusion pairs and the value is ignored.
+        db_path: Optional path to benchmark DB. Reserved for the same reason.
+
+    Returns:
+        Tuple of (corrected_text, list_of_corrections).
+    """
+    from handwriting_engine.consensus import (
+        _CHAR_CONFUSION_PAIRS,
+        _confusion_pair_label,
+    )
+
+    wordlist = _DOMAIN_WORDLISTS.get(domain, _GENERAL_TERMS)
+    words = text.split()
+    corrections: list[Correction] = []
+    out: list[str] = []
+
+    for word in words:
+        # Strip leading / trailing non-alpha for lookup (mirrors correct_domain_terms)
+        stripped = word.rstrip(".,;:!?")
+        suffix = word[len(stripped):]
+        prefix = ""
+        i = 0
+        while i < len(stripped) and not stripped[i].isalpha() and not stripped[i].isdigit():
+            prefix += stripped[i]
+            i += 1
+        core_raw = stripped[i:]
+        j = len(core_raw)
+        while j > 0 and not core_raw[j - 1].isalpha() and not core_raw[j - 1].isdigit():
+            j -= 1
+        core = core_raw[:j]
+        suffix = core_raw[j:] + suffix
+
+        if len(core) < 3 or _SKIP_RE.match(core):
+            out.append(word)
+            continue
+
+        if core.lower() in wordlist:
+            out.append(word)
+            continue
+
+        # Generate 1-confusion-pair-swap candidates.
+        candidates: list[tuple[str, str]] = []  # (candidate_core, pair_label)
+        seen: set[str] = {core}
+        for alt, canon in _CHAR_CONFUSION_PAIRS:
+            label = _confusion_pair_label(alt, canon)
+            for src, dst in ((alt, canon), (canon, alt)):
+                idx = core.find(src)
+                while idx != -1:
+                    cand = core[:idx] + dst + core[idx + len(src):]
+                    if cand not in seen and cand.lower() in wordlist:
+                        candidates.append((cand, label))
+                        seen.add(cand)
+                    idx = core.find(src, idx + 1)
+
+        if len(candidates) != 1:
+            out.append(word)
+            continue
+
+        new_core, label = candidates[0]
+        # Preserve capitalization where possible — if the original core was
+        # capitalized at position 0, capitalize the swap result too.
+        if core[:1].isupper() and not new_core[:1].isupper():
+            new_core = new_core[:1].upper() + new_core[1:]
+        new_word = prefix + new_core + suffix
+        corrections.append(Correction(original=word, corrected=new_word, pair=label))
+        logger.info(
+            "Confusion-pair correction: '%s' -> '%s' (pair %s)",
+            word, new_word, label,
+        )
+        out.append(new_word)
+
+    return " ".join(out), corrections
+
+
 def correct(
     text: str,
     domain: str = "biology",
@@ -476,6 +590,12 @@ def correct(
     Returns input unchanged on the trained pass if no checkpoint is found.
     """
     heuristic_out = correct_domain_terms(text, domain)
+
+    # S5 confusion-pair-aware pass — runs after edit-distance-1 wordlist
+    # correction. Default ON; HE_CONFUSION_POSTPROCESS=0 disables for A/B.
+    if _confusion_postprocess_enabled():
+        heuristic_out, _ = correct_confusion_pairs(heuristic_out, domain=domain)
+
     heuristic_made_changes = heuristic_out != text
 
     if not _trained_corrector_enabled(use_trained):
