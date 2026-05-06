@@ -416,6 +416,76 @@ def benchmark_run_cmd(label, providers, strategies, domain, feed_lessons, smoke,
         click.echo(f"\nFed {count} lessons back to the lessons system.")
 
 
+@benchmark.command("sweep")
+@click.option("--provider", "-p", default="gemini",
+              help="Provider used for all 5 strategies (default: gemini)")
+@click.option("--yes", "-y", is_flag=True,
+              help="Bypass cost confirmation")
+@click.option("--db-path", default=None, hidden=True)
+def benchmark_sweep(provider, yes, db_path):
+    """Run all 5 strategies against the IAM test set, one run_id per strategy.
+
+    Strategies: baseline, self_correct, line_level, prompt_adapted, zoomed_verify.
+    Requires IAM samples in the DB — run `benchmark ingest-iam` first.
+    Prints projected cost before any API call.
+    """
+    from handwriting_engine.benchmark.evaluate import (
+        run_sweep, SWEEP_STRATEGIES, estimate_cost,
+    )
+    from handwriting_engine.benchmark.db import get_connection as _get_conn
+
+    # Count IAM samples with ground truth
+    conn = _get_conn(db_path)
+    try:
+        row = conn.execute(
+            "SELECT COUNT(DISTINCT s.id) AS n FROM samples s "
+            "JOIN ground_truths gt ON gt.sample_id = s.id "
+            "WHERE s.category = 'iam'"
+        ).fetchone()
+        n_samples = row["n"] if row else 0
+    finally:
+        conn.close()
+
+    # Cost projection: ~2000 input + ~200 output tokens per sample per strategy
+    est_per_strategy = estimate_cost(2000 * n_samples, 200 * n_samples, provider)
+    est_total = est_per_strategy * len(SWEEP_STRATEGIES)
+
+    click.echo(
+        f"\nSweep projection: {len(SWEEP_STRATEGIES)} strategies "
+        f"x {n_samples} IAM samples (provider={provider})"
+    )
+    click.echo(
+        f"  Estimated cost: ~${est_per_strategy:.4f}/strategy "
+        f"x {len(SWEEP_STRATEGIES)} = ~${est_total:.4f} total"
+    )
+    click.echo(
+        f"  Strategies: {', '.join(s['name'] for s in SWEEP_STRATEGIES)}\n"
+    )
+
+    if n_samples == 0:
+        click.echo(
+            "WARNING: No IAM samples with ground truth in DB. "
+            "Run `benchmark ingest-iam` first.",
+            err=True,
+        )
+
+    if not yes:
+        click.confirm(
+            f"Proceed with sweep (~${est_total:.4f} projected)?",
+            abort=True,
+        )
+
+    try:
+        run_ids = run_sweep(provider=provider, db_path=db_path, yes=yes)
+    except Exception as exc:
+        click.echo(f"ERROR during sweep: {exc}", err=True)
+        sys.exit(1)
+
+    click.echo("\nSweep complete:")
+    for name, run_id in run_ids.items():
+        click.echo(f"  {name:20s}: run_id={run_id}")
+
+
 @benchmark.command("report")
 @click.option("--run-id", "-r", default=None, type=int, help="Specific run (default: latest)")
 @click.option("--format", "fmt", default="table", type=click.Choice(["table", "json", "csv"]))
