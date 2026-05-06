@@ -219,6 +219,163 @@ class TestOrchestrator:
         assert isinstance(result, str)
 
 
+class TestFidelityCheck:
+    def test_change_ratio_identical(self):
+        from handwriting_engine.postprocess import _change_ratio
+        assert _change_ratio("hello", "hello") == 0.0
+
+    def test_change_ratio_one_char_swap(self):
+        from handwriting_engine.postprocess import _change_ratio
+        # 1 char different out of 5 = 0.2
+        assert abs(_change_ratio("hello", "hella") - 0.2) < 1e-9
+
+    def test_change_ratio_total_rewrite(self):
+        from handwriting_engine.postprocess import _change_ratio
+        # Long enough that no character coincidence wrecks the ratio
+        assert _change_ratio("aaaaaaaaaa", "bbbbbbbbbb") == 1.0
+
+    def test_change_ratio_mitochondria_to_nucleotide(self):
+        # The canonical hallucination case — should be > 0.35 threshold
+        from handwriting_engine.postprocess import _change_ratio
+        assert _change_ratio("mitochondria", "nucleotide") > 0.35
+
+    def test_change_ratio_small_typo_below_threshold(self):
+        # mitocondria → mitochondria — legitimate fix, should be < 0.35
+        from handwriting_engine.postprocess import _change_ratio
+        assert _change_ratio("mitochondria", "mitocondria") < 0.35
+
+    def test_within_fidelity_passes_typo(self):
+        from handwriting_engine.postprocess import _within_fidelity
+        assert _within_fidelity("the mitochondria", "the mitocondria", 0.35)
+
+    def test_within_fidelity_rejects_hallucination(self):
+        from handwriting_engine.postprocess import _within_fidelity
+        # Substituting one word for an unrelated one of similar length
+        assert not _within_fidelity("the mitochondria", "the nucleotide", 0.35)
+
+
+class TestConfidenceGate:
+    def test_skips_trained_when_input_clean(self):
+        # When the heuristic doesn't fire, the gate should keep us on the heuristic output
+        # Verified via env var: use_trained=True but require_heuristic_hit defaults to True
+        from handwriting_engine.postprocess import correct
+        # Clean input — heuristic won't change anything; trained pass should skip
+        result = correct(
+            "the mitochondria is the powerhouse",  # already clean
+            "biology",
+            use_trained=True,  # opt in, but the gate should still skip
+        )
+        # Result should equal input (no checkpoint anyway, so this also tests graceful fallback)
+        assert "mitochondria" in result
+
+    def test_runs_trained_when_heuristic_corrects(self):
+        # When the heuristic DOES fire, we want the trained pass to run.
+        # We don't check the trained output here (no checkpoint); we only check that
+        # the orchestrator doesn't crash and returns a string.
+        from handwriting_engine.postprocess import correct
+        result = correct(
+            "the mitocondria is the powerhouse",  # heuristic will fix mitocondria
+            "biology",
+            use_trained=True,
+        )
+        assert "mitochondria" in result
+
+    def test_require_heuristic_hit_false_disables_gate(self):
+        from handwriting_engine.postprocess import correct
+        # With the gate off, the trained pass should be attempted even on clean text
+        # (no crash, returns string)
+        result = correct(
+            "the mitochondria is the powerhouse",
+            "biology",
+            use_trained=True,
+            require_heuristic_hit=False,
+        )
+        assert isinstance(result, str)
+
+
+class TestRealDataLoader:
+    def test_returns_empty_when_db_missing(self, tmp_path):
+        from handwriting_engine.trained_correction.dataset import from_benchmark_db
+        nonexistent = tmp_path / "nope.db"
+        result = from_benchmark_db(db_path=str(nonexistent))
+        assert result == []
+
+    def test_loads_pairs_from_minimal_db(self, tmp_path):
+        # Build a tiny benchmark DB by hand (subset of the real schema)
+        import sqlite3
+        db_path = tmp_path / "bench.db"
+        conn = sqlite3.connect(db_path)
+        conn.executescript("""
+            CREATE TABLE samples (id INTEGER PRIMARY KEY, image_path TEXT, image_hash TEXT UNIQUE);
+            CREATE TABLE ground_truths (id INTEGER PRIMARY KEY, sample_id INTEGER, text TEXT);
+            CREATE TABLE provider_outputs (
+                id INTEGER PRIMARY KEY, run_id INTEGER, sample_id INTEGER,
+                provider TEXT, strategy TEXT, output_text TEXT, error TEXT
+            );
+            INSERT INTO samples (id, image_path, image_hash) VALUES (1, '/tmp/a.png', 'h1');
+            INSERT INTO ground_truths (sample_id, text) VALUES (1, 'the mitochondria is here');
+            INSERT INTO provider_outputs (run_id, sample_id, provider, strategy, output_text, error)
+                VALUES (1, 1, 'gemini', 'single', 'the mitocondria is here', NULL);
+        """)
+        conn.commit()
+        conn.close()
+
+        from handwriting_engine.trained_correction.dataset import from_benchmark_db
+        result = from_benchmark_db(db_path=str(db_path))
+        assert len(result) == 1
+        assert result[0].corrupted == "the mitocondria is here"
+        assert result[0].clean == "the mitochondria is here"
+
+    def test_filters_by_provider(self, tmp_path):
+        import sqlite3
+        db_path = tmp_path / "bench2.db"
+        conn = sqlite3.connect(db_path)
+        conn.executescript("""
+            CREATE TABLE samples (id INTEGER PRIMARY KEY, image_path TEXT, image_hash TEXT UNIQUE);
+            CREATE TABLE ground_truths (id INTEGER PRIMARY KEY, sample_id INTEGER, text TEXT);
+            CREATE TABLE provider_outputs (
+                id INTEGER PRIMARY KEY, run_id INTEGER, sample_id INTEGER,
+                provider TEXT, strategy TEXT, output_text TEXT, error TEXT
+            );
+            INSERT INTO samples (id, image_path, image_hash) VALUES (1, '/tmp/a.png', 'h1');
+            INSERT INTO ground_truths (sample_id, text) VALUES (1, 'the mitochondria is here');
+            INSERT INTO provider_outputs (run_id, sample_id, provider, strategy, output_text, error)
+                VALUES (1, 1, 'gemini', 'single', 'the mitocondria is here', NULL),
+                       (1, 1, 'openai', 'single', 'the mtcondria is here', NULL);
+        """)
+        conn.commit()
+        conn.close()
+
+        from handwriting_engine.trained_correction.dataset import from_benchmark_db
+        gemini_only = from_benchmark_db(db_path=str(db_path), providers=["gemini"])
+        assert len(gemini_only) == 1
+        assert gemini_only[0].corrupted == "the mitocondria is here"
+
+    def test_skips_identical_pairs(self, tmp_path):
+        # When VLM happens to nail the answer, skip — no training signal
+        import sqlite3
+        db_path = tmp_path / "bench3.db"
+        conn = sqlite3.connect(db_path)
+        conn.executescript("""
+            CREATE TABLE samples (id INTEGER PRIMARY KEY, image_path TEXT, image_hash TEXT UNIQUE);
+            CREATE TABLE ground_truths (id INTEGER PRIMARY KEY, sample_id INTEGER, text TEXT);
+            CREATE TABLE provider_outputs (
+                id INTEGER PRIMARY KEY, run_id INTEGER, sample_id INTEGER,
+                provider TEXT, strategy TEXT, output_text TEXT, error TEXT
+            );
+            INSERT INTO samples (id, image_path, image_hash) VALUES (1, '/tmp/a.png', 'h1');
+            INSERT INTO ground_truths (sample_id, text) VALUES (1, 'the mitochondria is here');
+            INSERT INTO provider_outputs (run_id, sample_id, provider, strategy, output_text, error)
+                VALUES (1, 1, 'gemini', 'single', 'the mitochondria is here', NULL);
+        """)
+        conn.commit()
+        conn.close()
+
+        from handwriting_engine.trained_correction.dataset import from_benchmark_db
+        result = from_benchmark_db(db_path=str(db_path))
+        assert result == []
+
+
 # =====================================================================
 # Integration tests for the trained model itself (gated)
 # =====================================================================

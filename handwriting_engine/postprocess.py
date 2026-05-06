@@ -444,6 +444,8 @@ def correct(
     text: str,
     domain: str = "biology",
     use_trained: bool | None = None,
+    fidelity_threshold: float = 0.35,
+    require_heuristic_hit: bool = True,
 ) -> str:
     """Full post-correction orchestrator: heuristic pass first, optional trained pass second.
 
@@ -454,17 +456,80 @@ def correct(
     introduce errors the heuristic then can't undo because they look like
     valid words.
 
+    Two safeguards mitigate the synthetic-to-real hallucination failure mode:
+
+    1. **Confidence gate** (`require_heuristic_hit=True`): only run the trained
+       model when the heuristic actually made a correction. Rationale: if the
+       heuristic found errors, there are likely more of them; if it didn't,
+       either the input is clean (trained pass risks rewriting it) or the
+       errors are out-of-vocabulary (trained pass tends to hallucinate
+       plausible-sounding wrong words). Flip to False to always run trained.
+
+    2. **Fidelity check** (`fidelity_threshold`): if the trained pass changes
+       too much of the text (Levenshtein-distance ratio > threshold), reject
+       its output and keep the heuristic result. Threshold is a fraction of
+       max(len_in, len_out). Default 0.35 catches the canonical hallucination
+       pattern (`niitochondria → nucleotide` is ~62% changed) while permitting
+       legitimate corrections (`mitocondria → mitochondria` is ~8%).
+
     `use_trained` precedence: explicit > env var HE_USE_TRAINED_CORRECTOR > off.
     Returns input unchanged on the trained pass if no checkpoint is found.
     """
-    out = correct_domain_terms(text, domain)
-    if _trained_corrector_enabled(use_trained):
-        try:
-            from handwriting_engine.trained_correction.corrector import correct as trained_correct, is_available
-            if is_available():
-                out = trained_correct(out)
-            else:
-                logger.debug("Trained corrector requested but no checkpoint found")
-        except ImportError:
-            logger.warning("Trained corrector requested but optional deps missing; skipping")
-    return out
+    heuristic_out = correct_domain_terms(text, domain)
+    heuristic_made_changes = heuristic_out != text
+
+    if not _trained_corrector_enabled(use_trained):
+        return heuristic_out
+
+    if require_heuristic_hit and not heuristic_made_changes:
+        # Confidence gate: heuristic didn't fire, so the trained model is at
+        # higher risk of hallucinating. Skip and return clean input.
+        logger.debug("Confidence gate: heuristic made no changes; skipping trained pass")
+        return heuristic_out
+
+    try:
+        from handwriting_engine.trained_correction.corrector import correct as trained_correct, is_available
+        if not is_available():
+            logger.debug("Trained corrector requested but no checkpoint found")
+            return heuristic_out
+        trained_out = trained_correct(heuristic_out)
+    except ImportError:
+        logger.warning("Trained corrector requested but optional deps missing; skipping")
+        return heuristic_out
+
+    # Fidelity check: reject pathological rewrites
+    if not _within_fidelity(heuristic_out, trained_out, fidelity_threshold):
+        logger.info(
+            "Fidelity check: trained output diverges too far from heuristic output; "
+            "falling back. ratio=%.2f threshold=%.2f",
+            _change_ratio(heuristic_out, trained_out),
+            fidelity_threshold,
+        )
+        return heuristic_out
+    return trained_out
+
+
+def _change_ratio(a: str, b: str) -> float:
+    """Levenshtein distance / max(len_a, len_b). 0.0 = identical, 1.0 = totally different."""
+    if not a and not b:
+        return 0.0
+    if a == b:
+        return 0.0
+    # Inline Levenshtein (avoid pulling jiwer / other deps for one call site)
+    if not a:
+        return 1.0
+    if not b:
+        return 1.0
+    prev = list(range(len(b) + 1))
+    cur = [0] * (len(b) + 1)
+    for i, ca in enumerate(a, 1):
+        cur[0] = i
+        for j, cb in enumerate(b, 1):
+            cur[j] = min(cur[j - 1] + 1, prev[j] + 1, prev[j - 1] + (0 if ca == cb else 1))
+        prev, cur = cur, prev
+    return prev[len(b)] / max(len(a), len(b))
+
+
+def _within_fidelity(reference: str, candidate: str, threshold: float) -> bool:
+    """True if the candidate is similar enough to the reference to be trusted."""
+    return _change_ratio(reference, candidate) <= threshold

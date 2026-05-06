@@ -56,6 +56,82 @@ def build_pairs(
     return out
 
 
+def from_benchmark_db(
+    db_path: str | None = None,
+    providers: list[str] | None = None,
+    strategies: list[str] | None = None,
+    min_text_chars: int = 10,
+) -> list[CorrectionExample]:
+    """Load real `(VLM_output, ground_truth)` pairs from the engine's benchmark DB.
+
+    Joins `provider_outputs` and `ground_truths` on `sample_id`. Each row produces
+    one (corrupted=VLM output, clean=ground truth) pair.
+
+    Returns [] (with a logged debug message) if the DB doesn't exist yet — this is
+    the common case before Phase 7 ingestion lands. Callers can mix this with
+    synthetic pairs from `build_pairs()` to fine-tune.
+
+    Args:
+        db_path: Override the default SQLite path (~/.handwriting-engine/benchmark.db).
+        providers: Filter to specific providers (e.g. ["gemini", "claude"]). None = all.
+        strategies: Filter to specific consensus strategies. None = all.
+        min_text_chars: Drop pairs where either text is shorter than this. Filters out
+            degenerate / corrupt rows that would teach the corrector wrong patterns.
+    """
+    import logging
+    import sqlite3
+    from pathlib import Path
+
+    log = logging.getLogger(__name__)
+    if db_path is None:
+        db_path = str(Path.home() / ".handwriting-engine" / "benchmark.db")
+    if not Path(db_path).is_file():
+        log.debug("Benchmark DB not found at %s — returning empty pair list", db_path)
+        return []
+
+    sql_parts = [
+        "SELECT po.output_text AS corrupted, gt.text AS clean",
+        "FROM provider_outputs po",
+        "JOIN ground_truths gt ON po.sample_id = gt.sample_id",
+        "WHERE po.error IS NULL",
+        "  AND length(po.output_text) >= ?",
+        "  AND length(gt.text) >= ?",
+    ]
+    params: list = [min_text_chars, min_text_chars]
+    if providers:
+        placeholders = ",".join("?" * len(providers))
+        sql_parts.append(f"  AND po.provider IN ({placeholders})")
+        params.extend(providers)
+    if strategies:
+        placeholders = ",".join("?" * len(strategies))
+        sql_parts.append(f"  AND po.strategy IN ({placeholders})")
+        params.extend(strategies)
+    sql = "\n".join(sql_parts)
+
+    out: list[CorrectionExample] = []
+    seen: set[tuple[str, str]] = set()
+    try:
+        with sqlite3.connect(db_path) as conn:
+            cur = conn.execute(sql, params)
+            for corrupted, clean in cur:
+                # Dedupe identical (corrupted, clean) pairs — multiple providers can
+                # produce the same output; we don't want to weight a pair more heavily
+                # just because three providers agreed on the wrong answer.
+                key = (corrupted, clean)
+                if key in seen:
+                    continue
+                if corrupted == clean:
+                    continue  # No correction signal — skip
+                seen.add(key)
+                out.append(CorrectionExample(corrupted=corrupted, clean=clean))
+    except sqlite3.DatabaseError as e:
+        log.warning("Failed reading benchmark DB %s: %s", db_path, e)
+        return []
+
+    log.info("Loaded %d real (corrupted, clean) pairs from %s", len(out), db_path)
+    return out
+
+
 def split_pairs(
     pairs: list[CorrectionExample],
     val_frac: float = 0.05,
