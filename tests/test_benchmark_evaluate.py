@@ -586,22 +586,95 @@ class TestSweep:
 
 
 class TestPerWriterReport:
-    """RED stubs for per-writer report (IAM-03). All must FAIL until Wave 2."""
+    """Per-writer report (IAM-03) — turned GREEN in Phase 07-04."""
 
-    def test_per_writer_report_groups_by_student(self, seeded_db):
-        pytest.fail(
-            "not implemented — generate_per_writer_report must group CER by "
-            "samples.student and return a formatted table string"
+    @patch("handwriting_engine.benchmark.evaluate._available_providers")
+    @patch("handwriting_engine.benchmark.evaluate._read_single")
+    def test_per_writer_report_groups_by_student(self, mock_read, mock_providers, db_path, tmp_path):
+        from PIL import Image
+
+        # Seed two IAM-tagged samples for two different writers
+        conn = get_connection(db_path)
+        img_a = tmp_path / "a.png"
+        img_b = tmp_path / "b.png"
+        Image.new("RGB", (200, 200), color=(128, 128, 128)).save(img_a)
+        Image.new("RGB", (200, 200), color=(128, 128, 128)).save(img_b)
+        sid_a = insert_sample(conn, str(img_a), "hashA",
+                              student="iam-writer-a01", category="iam")
+        sid_b = insert_sample(conn, str(img_b), "hashB",
+                              student="iam-writer-b02", category="iam")
+        insert_ground_truth(conn, sid_a, "the mitochondria is the powerhouse of the cell")
+        insert_ground_truth(conn, sid_b, "the mitochondria is the powerhouse of the cell")
+        conn.close()
+
+        mock_providers.return_value = ["gemini"]
+        # Writer a01 perfect, writer b02 has one substitution
+        def fake_read(path, *args, **kwargs):
+            if "a.png" in path:
+                text = "the mitochondria is the powerhouse of the cell"
+            else:
+                text = "the mitochondria is the powerhouse of the sell"
+            return {
+                "text": text,
+                "confidence": 0.7, "latency_ms": 500,
+                "input_tokens": 100, "output_tokens": 50, "error": None,
+            }
+        mock_read.side_effect = fake_read
+
+        run_id = run_benchmark(
+            providers=["gemini"], strategies=[], db_path=db_path,
         )
 
-    def test_per_writer_report_no_writers(self, seeded_db):
-        pytest.fail(
-            "not implemented — generate_per_writer_report on run with no student "
-            "data must return a message indicating no writer data available"
+        report = generate_per_writer_report(run_id=run_id, db_path=db_path)
+        assert "iam-writer-a01" in report
+        assert "iam-writer-b02" in report
+        assert "Writer" in report  # header
+        assert "Mean CER" in report
+
+    @patch("handwriting_engine.benchmark.evaluate._available_providers")
+    @patch("handwriting_engine.benchmark.evaluate._read_single")
+    def test_per_writer_report_no_writers(self, mock_read, mock_providers, seeded_db):
+        # seeded_db has student="test" — but the function only includes writers
+        # with non-empty student. The seeded sample has student="test", so let's
+        # blank it out to trigger the empty path.
+        conn = get_connection(seeded_db)
+        try:
+            conn.execute("UPDATE samples SET student=''")
+            conn.commit()
+        finally:
+            conn.close()
+
+        mock_providers.return_value = ["gemini"]
+        mock_read.return_value = {
+            "text": "the mitochondria is the powerhouse of the cell",
+            "confidence": 0.7, "latency_ms": 500,
+            "input_tokens": 100, "output_tokens": 50, "error": None,
+        }
+        run_id = run_benchmark(
+            providers=["gemini"], strategies=[], db_path=seeded_db,
         )
+        report = generate_per_writer_report(run_id=run_id, db_path=seeded_db)
+        assert "No writer data" in report
 
     def test_report_cli_per_writer_flag(self, tmp_path):
-        pytest.fail(
-            "not implemented — `benchmark report --per-writer` CLI flag must exist "
-            "and invoke generate_per_writer_report"
+        from handwriting_engine.cli import cli
+
+        db_path = tmp_path / "empty.db"
+        get_connection(db_path).close()
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ["benchmark", "report", "--per-writer", "--db-path", str(db_path)],
         )
+        assert result.exit_code == 0, result.output
+        # Empty DB: function returns "No runs found" or similar
+        assert (
+            "No runs found" in result.output
+            or "No writer data" in result.output
+            or "Per-Writer CER" in result.output
+        )
+
+        # Help advertises the flag
+        help_result = runner.invoke(cli, ["benchmark", "report", "--help"])
+        assert "--per-writer" in help_result.output
