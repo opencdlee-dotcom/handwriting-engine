@@ -82,37 +82,110 @@ def enhance(path, strategy, output):
     click.echo(f"Enhanced: {result}")
 
 
+_ALT_MARKER_RE = __import__("re").compile(r"\[\?alt:\s*([^\]]+)\]")
+
+
+def _extract_alt_markers(text: str) -> list[dict]:
+    """Pull `[?alt: a/b]` markers out of consensus text into a structured list.
+
+    Skill-side `--strict` mode uses these to prompt the user once per ambiguity.
+    """
+    markers = []
+    for match in _ALT_MARKER_RE.finditer(text):
+        alts = [a.strip() for a in match.group(1).split("/") if a.strip()]
+        markers.append({"raw": match.group(0), "alternatives": alts})
+    return markers
+
+
 @cli.command()
 @click.argument("path", type=click.Path(exists=True))
 @click.option("--provider", "-p", default="claude", type=click.Choice(["claude", "openai", "gemini", "consensus"]))
-@click.option("--domain", "-d", default="biology")
+@click.option("--domain", "-d", default="general",
+              help="Domain hint (general, biology, ...). Default 'general' so skill callers pass --domain=bio explicitly.")
 @click.option("--prompt", default="", help="Custom reading prompt")
-def read(path, provider, domain, prompt):
+@click.option("--writer", default=None,
+              help="Writer ID for WriterProfileStore lookup (per-writer few-shot/calibration)")
+@click.option("--format", "fmt", default="txt",
+              type=click.Choice(["txt", "md", "json"]),
+              help="Output shape. 'json' emits a structured payload with extracted alt-markers — used by the handwriting-reader skill.")
+def read(path, provider, domain, prompt, writer, fmt):
     """Read handwritten text from image or PDF."""
-    import os
-
     if path.lower().endswith(".pdf"):
         import tempfile
         from handwriting_engine.pdf import convert_pdf
         tmpdir = tempfile.mkdtemp(prefix="hwe_read_")
         _temp_dirs.append(tmpdir)
         pages = convert_pdf(path, tmpdir)
-        image_paths = [p["path"] for p in pages]
+        image_paths = [(p.get("page_number", i + 1), p["path"]) for i, p in enumerate(pages)]
     else:
-        image_paths = [path]
+        image_paths = [(1, path)]
 
-    for img in image_paths:
+    page_payloads = []
+    for page_no, img in image_paths:
         if provider == "consensus":
-            from handwriting_engine.vision import read_with_consensus
-            result = read_with_consensus(img, prompt=prompt, domain=domain)
-            click.echo(f"--- Confidence: {result.confidence:.2f} ({result.strategy_used}) ---")
-            click.echo(result.text)
-            if result.disagreements:
-                click.echo(f"\nDisagreements: {result.disagreements}")
+            from handwriting_engine import vision as _vision
+            result = _vision.read_with_consensus(img, prompt=prompt, domain=domain, writer_id=writer)
+            page_payloads.append({
+                "page_number": page_no,
+                "image_path": img,
+                "text": result.text,
+                "provider": "consensus",
+                "confidence": result.confidence,
+                "confidence_level": result.confidence_level,
+                "strategy_used": result.strategy_used,
+                "disagreements": list(result.disagreements),
+                "alt_markers": _extract_alt_markers(result.text),
+                "provider_results": dict(result.provider_results),
+                "tokens_used": dict(result.tokens_used),
+            })
         else:
-            from handwriting_engine.vision import read_page
-            text = read_page(img, prompt=prompt, domain=domain, provider=provider)
-            click.echo(text)
+            from handwriting_engine import vision as _vision
+            text = _vision.read_page(img, prompt=prompt, domain=domain, provider=provider)
+            page_payloads.append({
+                "page_number": page_no,
+                "image_path": img,
+                "text": text,
+                "provider": provider,
+                "confidence": None,
+                "confidence_level": None,
+                "strategy_used": None,
+                "disagreements": [],
+                "alt_markers": _extract_alt_markers(text),
+                "provider_results": {provider: text},
+                "tokens_used": {},
+            })
+
+    if fmt == "json":
+        click.echo(json.dumps({
+            "path": path,
+            "domain": domain,
+            "writer": writer,
+            "pages": page_payloads,
+        }, indent=2))
+        return
+
+    if fmt == "md":
+        for p in page_payloads:
+            header = f"## Page {p['page_number']}"
+            if p["confidence"] is not None:
+                header += f" — confidence {p['confidence']:.2f} ({p['confidence_level']})"
+            click.echo(header)
+            click.echo("")
+            click.echo(p["text"])
+            click.echo("")
+            if p["disagreements"]:
+                click.echo(f"_Disagreements: {p['disagreements']}_\n")
+        return
+
+    # Default: txt — preserve legacy echo behavior
+    for p in page_payloads:
+        if p["provider"] == "consensus":
+            click.echo(f"--- Confidence: {p['confidence']:.2f} ({p['strategy_used']}) ---")
+            click.echo(p["text"])
+            if p["disagreements"]:
+                click.echo(f"\nDisagreements: {p['disagreements']}")
+        else:
+            click.echo(p["text"])
 
 
 @cli.command()
