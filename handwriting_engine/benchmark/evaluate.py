@@ -87,6 +87,8 @@ def _read_single(
     image_path: str, provider: str, domain: str,
     auto_enhance: bool = False, inject_lessons: bool = False,
     enhance_strategy: str | None = None,
+    line_level: bool = False,
+    auto_retry: bool = False,
 ) -> dict:
     """Read a single image with one provider. Returns result dict."""
     from handwriting_engine.vision import read_page
@@ -125,6 +127,8 @@ def _read_single(
         text = read_page(
             actual_path, domain=domain, provider=provider,
             inject_lessons=inject_lessons,
+            line_level=line_level,
+            auto_retry=auto_retry,
         )
         penalty = text.count("[?]") * 0.05 + text.count("[illegible") * 0.1
         confidence = max(0.0, min(0.95, 1.0 - penalty))
@@ -217,6 +221,8 @@ def run_benchmark(
     iam_partition: str | None = None,
     vocabulary_hints: list[str] | None = None,
     vocab_hints_off: int = 0,
+    line_level: bool = False,
+    auto_retry: bool = False,
 ) -> int:
     """Execute a full benchmark run.
 
@@ -252,6 +258,8 @@ def run_benchmark(
             iam_partition=iam_partition,
             vocabulary_hints=vocabulary_hints,
             vocab_hints_off=vocab_hints_off,
+            line_level=line_level,
+            auto_retry=auto_retry,
         )
     finally:
         conn.close()
@@ -272,6 +280,8 @@ def _run_benchmark_inner(
     iam_partition: str | None = None,
     vocabulary_hints: list[str] | None = None,
     vocab_hints_off: int = 0,
+    line_level: bool = False,
+    auto_retry: bool = False,
 ) -> int:
     """Inner benchmark logic with connection managed by caller."""
     # Resolve providers
@@ -332,7 +342,12 @@ def _run_benchmark_inner(
 
         # Single-provider reads
         for provider in providers:
-            result = _read_single(sample.image_path, provider, domain, auto_enhance, inject_lessons, enhance_strategy)
+            result = _read_single(
+                sample.image_path, provider, domain,
+                auto_enhance, inject_lessons, enhance_strategy,
+                line_level=line_level,
+                auto_retry=auto_retry,
+            )
             # Compute marker rate from raw text BEFORE any normalization
             raw_text = result["text"]
             marker_rate = _compute_marker_rate(raw_text) if raw_text else None
@@ -519,3 +534,82 @@ def _select_smoke_samples(conn, samples: list, limit: int = 3) -> list:
         selected.extend(remaining[: limit - len(selected)])
 
     return selected
+
+
+SWEEP_STRATEGIES = [
+    {
+        "name": "baseline",
+        "label": "sweep:baseline",
+        "kwargs": {"strategies": [], "vocab_hints_off": 1, "auto_enhance": False},
+    },
+    {
+        "name": "self_correct",
+        "label": "sweep:self_correct",
+        "kwargs": {"strategies": ["self_correct"]},
+    },
+    {
+        "name": "line_level",
+        "label": "sweep:line_level",
+        "kwargs": {"strategies": [], "line_level": True},
+    },
+    {
+        "name": "prompt_adapted",
+        "label": "sweep:prompt_adapted",
+        # prompt_adapter is applied by default in read_page(); distinguished from
+        # baseline by leaving vocab_hints_off at default (0 = hints ON).
+        "kwargs": {"strategies": []},
+    },
+    {
+        "name": "zoomed_verify",
+        "label": "sweep:zoomed_verify",
+        "kwargs": {"strategies": [], "auto_retry": True},
+    },
+]
+
+
+def run_sweep(
+    provider: str = "gemini",
+    db_path: Path | str | None = None,
+    yes: bool = False,
+    on_progress: Callable[[int, int, str], None] | None = None,
+) -> dict[str, int]:
+    """Execute all 5 sweep strategies against IAM samples (IAM-02).
+
+    Fetches IAM sample IDs (samples.category='iam' with ground truth) from the
+    DB and passes them to run_benchmark() once per strategy. Returns a dict
+    mapping strategy name to run_id.
+
+    Args:
+        provider: Provider used for all strategies.
+        db_path: Override database path.
+        yes: Reserved for future per-strategy confirmation; CLI guards cost upstream.
+        on_progress: Optional progress callback forwarded to run_benchmark.
+
+    Returns:
+        Dict {strategy_name: run_id} with exactly 5 keys matching SWEEP_STRATEGIES.
+    """
+    conn = get_connection(db_path)
+    try:
+        rows = conn.execute(
+            """SELECT DISTINCT s.id AS id FROM samples s
+               JOIN ground_truths gt ON gt.sample_id = s.id
+               WHERE s.category = 'iam'
+               ORDER BY s.id"""
+        ).fetchall()
+        sample_ids = [r["id"] for r in rows]
+    finally:
+        conn.close()
+
+    run_ids: dict[str, int] = {}
+    for config in SWEEP_STRATEGIES:
+        run_id = run_benchmark(
+            label=config["label"],
+            providers=[provider],
+            sample_ids=sample_ids if sample_ids else None,
+            db_path=db_path,
+            on_progress=on_progress,
+            **config["kwargs"],
+        )
+        run_ids[config["name"]] = run_id
+
+    return run_ids

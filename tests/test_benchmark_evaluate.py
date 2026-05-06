@@ -468,37 +468,121 @@ class TestCompareRuns:
 
 
 class TestSweep:
-    """RED stubs for sweep infrastructure (IAM-02). All must FAIL until Wave 2."""
+    """Sweep infrastructure (IAM-02) — turned GREEN in Phase 07-03."""
 
-    def test_run_benchmark_accepts_line_level(self, seeded_db):
-        pytest.fail(
-            "not implemented — run_benchmark must accept line_level=True "
-            "and thread it through to _read_single"
-        )
+    @patch("handwriting_engine.benchmark.evaluate._available_providers")
+    @patch("handwriting_engine.benchmark.evaluate._read_single")
+    def test_run_benchmark_accepts_line_level(self, mock_read, mock_providers, seeded_db):
+        mock_providers.return_value = ["gemini"]
+        mock_read.return_value = {
+            "text": "the mitochondria is the powerhouse of the cell",
+            "confidence": 0.7, "latency_ms": 500,
+            "input_tokens": 100, "output_tokens": 50, "error": None,
+        }
 
-    def test_run_benchmark_accepts_auto_retry(self, seeded_db):
-        pytest.fail(
-            "not implemented — run_benchmark must accept auto_retry=True "
-            "and thread it through to _read_single"
+        run_id = run_benchmark(
+            providers=["gemini"], strategies=[], db_path=seeded_db,
+            line_level=True,
         )
+        assert run_id > 0
+        # _read_single must receive line_level=True
+        kwargs = mock_read.call_args.kwargs
+        assert kwargs.get("line_level") is True
 
-    def test_run_sweep_returns_five_run_ids(self, seeded_db):
-        pytest.fail(
-            "not implemented — run_sweep must return a dict with exactly 5 keys: "
-            "baseline, self_correct, line_level, prompt_adapted, zoomed_verify"
+    @patch("handwriting_engine.benchmark.evaluate._available_providers")
+    @patch("handwriting_engine.benchmark.evaluate._read_single")
+    def test_run_benchmark_accepts_auto_retry(self, mock_read, mock_providers, seeded_db):
+        mock_providers.return_value = ["gemini"]
+        mock_read.return_value = {
+            "text": "the mitochondria is the powerhouse of the cell",
+            "confidence": 0.7, "latency_ms": 500,
+            "input_tokens": 100, "output_tokens": 50, "error": None,
+        }
+
+        run_id = run_benchmark(
+            providers=["gemini"], strategies=[], db_path=seeded_db,
+            auto_retry=True,
         )
+        assert run_id > 0
+        kwargs = mock_read.call_args.kwargs
+        assert kwargs.get("auto_retry") is True
+
+    @patch("handwriting_engine.benchmark.evaluate._available_providers")
+    @patch("handwriting_engine.benchmark.evaluate._read_single")
+    def test_run_sweep_returns_five_run_ids(self, mock_read, mock_providers, seeded_db):
+        # run_sweep filters samples to category='iam' only — ensure the seeded
+        # sample has that category so each strategy actually evaluates something.
+        conn = get_connection(seeded_db)
+        try:
+            conn.execute("UPDATE samples SET category='iam' WHERE id=1")
+            conn.commit()
+        finally:
+            conn.close()
+
+        mock_providers.return_value = ["gemini"]
+        mock_read.return_value = {
+            "text": "the mitochondria is the powerhouse of the cell",
+            "confidence": 0.7, "latency_ms": 500,
+            "input_tokens": 100, "output_tokens": 50, "error": None,
+        }
+
+        run_ids = run_sweep(provider="gemini", db_path=seeded_db, yes=True)
+        assert isinstance(run_ids, dict)
+        assert set(run_ids.keys()) == {
+            "baseline", "self_correct", "line_level",
+            "prompt_adapted", "zoomed_verify",
+        }
+        assert all(isinstance(rid, int) and rid > 0 for rid in run_ids.values())
 
     def test_sweep_cli_shows_cost(self, tmp_path):
-        pytest.fail(
-            "not implemented — `benchmark sweep` CLI must print projected cost "
-            "before any API call (even with no real samples)"
-        )
+        from handwriting_engine.cli import cli
+        # Use an empty DB — cost projection must still run before any API call
+        db_path = tmp_path / "empty.db"
+        get_connection(db_path).close()
 
-    def test_sweep_cli_yes_executes(self, tmp_path):
-        pytest.fail(
-            "not implemented — `benchmark sweep --yes` must bypass cost confirmation "
-            "and attempt to execute all 5 strategies"
+        runner = CliRunner()
+        # Decline at the prompt — we only care that the cost line appears
+        result = runner.invoke(
+            cli,
+            ["benchmark", "sweep", "--db-path", str(db_path)],
+            input="n\n",
         )
+        assert "Estimated cost" in result.output
+        assert "Sweep projection" in result.output
+
+    @patch("handwriting_engine.benchmark.evaluate._available_providers")
+    @patch("handwriting_engine.benchmark.evaluate._read_single")
+    def test_sweep_cli_yes_executes(self, mock_read, mock_providers, tmp_path):
+        from handwriting_engine.cli import cli
+        from PIL import Image
+
+        db_path = tmp_path / "sweep.db"
+        conn = get_connection(db_path)
+        img_path = tmp_path / "iam.png"
+        Image.new("RGB", (200, 200), color=(128, 128, 128)).save(img_path)
+        sid = insert_sample(conn, str(img_path), "iamhash1",
+                            student="iam-writer-001", category="iam")
+        insert_ground_truth(conn, sid, "the mitochondria is the powerhouse of the cell")
+        conn.close()
+
+        mock_providers.return_value = ["gemini"]
+        mock_read.return_value = {
+            "text": "the mitochondria is the powerhouse of the cell",
+            "confidence": 0.7, "latency_ms": 500,
+            "input_tokens": 100, "output_tokens": 50, "error": None,
+        }
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ["benchmark", "sweep", "--yes", "--db-path", str(db_path)],
+        )
+        assert result.exit_code == 0, result.output
+        assert "Sweep complete" in result.output
+        # All 5 strategies must appear in the report
+        for name in ("baseline", "self_correct", "line_level",
+                     "prompt_adapted", "zoomed_verify"):
+            assert name in result.output
 
 
 class TestPerWriterReport:
