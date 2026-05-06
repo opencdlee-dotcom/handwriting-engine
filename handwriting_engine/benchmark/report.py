@@ -527,3 +527,69 @@ def confidence_calibration(
 
     lines.append("")
     return "\n".join(lines)
+
+
+def generate_per_writer_report(
+    run_id: int | None = None,
+    db_path: Path | str | None = None,
+) -> str:
+    """Per-writer CER breakdown for a benchmark run (IAM-03).
+
+    Groups eval_metrics by samples.student so the developer can tell whether a
+    strategy's CER gain is consistent across writers or driven by a few easy
+    ones. Requires samples to have been ingested with student tags (e.g. via
+    `benchmark ingest-iam`, which sets student='iam-writer-XXX').
+    """
+    conn = get_connection(db_path)
+    try:
+        if run_id is None:
+            run_id = get_latest_run_id(conn)
+        if run_id is None:
+            return "No runs found in database."
+
+        rows = conn.execute(
+            """SELECT s.student         AS student,
+                      AVG(em.cer)       AS mean_cer,
+                      MIN(em.cer)       AS min_cer,
+                      MAX(em.cer)       AS max_cer,
+                      COUNT(*)          AS n_samples
+               FROM provider_outputs po
+               JOIN eval_metrics em ON em.provider_output_id = po.id
+               JOIN samples s      ON s.id = po.sample_id
+               WHERE po.run_id = ?
+                 AND s.student IS NOT NULL
+                 AND s.student != ''
+               GROUP BY s.student
+               ORDER BY mean_cer DESC""",
+            (run_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        return (
+            f"Per-Writer CER (Run #{run_id})\n\n"
+            "No writer data found for this run.\n"
+            "Tip: ingest IAM samples with `benchmark ingest-iam` first — "
+            "only IAM samples carry per-writer tags."
+        )
+
+    header = f"{'Writer':<25} {'Mean CER':>9} {'Min CER':>9} {'Max CER':>9} {'N':>4}"
+    separator = "-" * len(header)
+    lines = [
+        f"Per-Writer CER (Run #{run_id})",
+        "",
+        header,
+        separator,
+    ]
+    for r in rows:
+        lines.append(
+            f"{r['student']:<25} "
+            f"{r['mean_cer']:>8.2%} "
+            f"{r['min_cer']:>8.2%} "
+            f"{r['max_cer']:>8.2%} "
+            f"{r['n_samples']:>4}"
+        )
+    lines.append(separator)
+    lines.append(f"  {len(rows)} writer(s) shown")
+    return "\n".join(lines)

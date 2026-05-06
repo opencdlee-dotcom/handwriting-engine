@@ -489,10 +489,17 @@ def benchmark_sweep(provider, yes, db_path):
 @benchmark.command("report")
 @click.option("--run-id", "-r", default=None, type=int, help="Specific run (default: latest)")
 @click.option("--format", "fmt", default="table", type=click.Choice(["table", "json", "csv"]))
-def benchmark_report_cmd(run_id, fmt):
+@click.option("--per-writer", is_flag=True, default=False,
+              help="Show per-writer CER breakdown (requires IAM samples with student tags)")
+@click.option("--db-path", default=None, hidden=True)
+def benchmark_report_cmd(run_id, fmt, per_writer, db_path):
     """Show accuracy comparison table for a benchmark run."""
-    from handwriting_engine.benchmark.report import generate_report
+    if per_writer:
+        from handwriting_engine.benchmark.report import generate_per_writer_report
+        click.echo(generate_per_writer_report(run_id=run_id, db_path=db_path))
+        return
 
+    from handwriting_engine.benchmark.report import generate_report
     click.echo(generate_report(run_id, fmt=fmt))
 
 
