@@ -348,10 +348,28 @@ def read_page(
 
     p = get_provider(provider)
 
+    # S2: per-writer few-shot exemplars. Returns None (fall through) when the
+    # writer has <2 GT samples, the provider is OCR-only, or HE_FEW_SHOT_K=0.
+    exemplar_blocks = None
+    if writer_id:
+        from handwriting_engine.few_shot import select_and_build_exemplar_blocks
+
+        exemplar_blocks = select_and_build_exemplar_blocks(
+            writer_id=writer_id,
+            provider=provider,
+            target_image_b64=b64_data,
+            target_media_type=media_type,
+        )
+
     # Dual-polarity reading for faint ink: send both normal and inverted images
     from handwriting_engine._constants import DUAL_POLARITY_ENABLED
     if DUAL_POLARITY_ENABLED and assessment and assessment.get("faint_ink"):
+        # Faint-ink dual-polarity wins over few-shot — they target different
+        # failure modes and combining them inflates per-call token cost
+        # without a verified gain.
         raw = _dual_polarity_read(image_path, b64_data, media_type, p, prompt, system_prompt, max_tokens)
+    elif exemplar_blocks is not None:
+        raw = p.read_batch(exemplar_blocks, prompt=prompt, system_prompt=system_prompt, max_tokens=max_tokens)
     else:
         raw = p.read_image(b64_data, media_type, prompt, system_prompt, max_tokens)
 
