@@ -11,11 +11,22 @@ Does NOT correct proper nouns, numbers, or abbreviations.
 
 from __future__ import annotations
 
+import os
 import re
 import logging
 from functools import lru_cache
 
 logger = logging.getLogger(__name__)
+
+
+def _trained_corrector_enabled(explicit: bool | None) -> bool:
+    """Resolve whether the trained corrector should run.
+
+    Precedence: explicit kwarg > env var > default off.
+    """
+    if explicit is not None:
+        return explicit
+    return os.environ.get("HE_USE_TRAINED_CORRECTOR", "").lower() in ("1", "true", "yes", "on")
 
 # Biology domain word list — common lab terms that OCR confuses
 _BIOLOGY_TERMS = {
@@ -427,3 +438,33 @@ def correct_domain_terms(text: str, domain: str = "biology") -> str:
         logger.info("Domain correction (%s): %d word(s) corrected", domain, corrections_made)
 
     return " ".join(corrected)
+
+
+def correct(
+    text: str,
+    domain: str = "biology",
+    use_trained: bool | None = None,
+) -> str:
+    """Full post-correction orchestrator: heuristic pass first, optional trained pass second.
+
+    Order matters. The heuristic pass is high-precision (only fires when
+    unambiguous) and runs cheap; running it first means the trained model
+    sees mostly-clean text and only has to fix the contextual / multi-char
+    errors the heuristic can't. Reversed order tends to let the trained model
+    introduce errors the heuristic then can't undo because they look like
+    valid words.
+
+    `use_trained` precedence: explicit > env var HE_USE_TRAINED_CORRECTOR > off.
+    Returns input unchanged on the trained pass if no checkpoint is found.
+    """
+    out = correct_domain_terms(text, domain)
+    if _trained_corrector_enabled(use_trained):
+        try:
+            from handwriting_engine.trained_correction.corrector import correct as trained_correct, is_available
+            if is_available():
+                out = trained_correct(out)
+            else:
+                logger.debug("Trained corrector requested but no checkpoint found")
+        except ImportError:
+            logger.warning("Trained corrector requested but optional deps missing; skipping")
+    return out

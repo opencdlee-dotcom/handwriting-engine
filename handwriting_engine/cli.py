@@ -558,5 +558,62 @@ def benchmark_bootstrap_gt_cmd(agreement, confidence):
     click.echo(f"Auto-generated {count} ground truths from consensus")
 
 
+# =====================================================================
+# Trained post-correction (optional — requires [trained-correction] extras)
+# =====================================================================
+
+@cli.group(name="trained-correction")
+def trained_correction_group():
+    """Train and evaluate the optional trained post-correction model.
+
+    Requires: pip install handwriting-engine[trained-correction]
+    """
+
+
+@trained_correction_group.command(name="train")
+@click.option("--output-dir", "-o", required=True, type=click.Path(),
+              help="Directory for the trained checkpoint + manifest")
+@click.option("--num-pairs", default=50000, type=int, help="Synthetic training pairs to generate")
+@click.option("--num-epochs", default=2, type=int)
+@click.option("--batch-size", default=8, type=int)
+@click.option("--learning-rate", default=3e-4, type=float)
+@click.option("--max-input-length", default=256, type=int)
+@click.option("--max-target-length", default=256, type=int)
+@click.option("--device", default="auto", type=click.Choice(["auto", "cpu", "mps", "cuda"]))
+@click.option("--seed", default=42, type=int)
+@click.option("--quick", is_flag=True, help="Tiny smoke run")
+@click.option("--no-system-wordlist", is_flag=True)
+@click.option("--model-name", default="google/byt5-small", show_default=True)
+def trained_correction_train(**kwargs):
+    """Fine-tune the synthetic-data corrector. Long-running."""
+    from handwriting_engine.trained_correction.train import main as train_main
+    argv: list[str] = []
+    for k, v in kwargs.items():
+        flag = "--" + k.replace("_", "-")
+        if isinstance(v, bool):
+            if v:
+                argv.append(flag)
+        elif v is not None:
+            argv.extend([flag, str(v)])
+    sys.exit(train_main(argv))
+
+
+@trained_correction_group.command(name="eval")
+@click.option("--n-pairs", default=1000, type=int)
+@click.option("--seed", default=1234, type=int)
+@click.option("--domain", default="biology")
+@click.option("--skip-trained", is_flag=True, help="Heuristic-only baseline (no model load)")
+@click.option("--output", default=None, type=click.Path(), help="Optional JSON output path")
+def trained_correction_eval(n_pairs, seed, domain, skip_trained, output):
+    """A/B evaluate post-correction pipelines on synthetic pairs."""
+    from handwriting_engine.trained_correction.eval import main as eval_main
+    argv = ["--n-pairs", str(n_pairs), "--seed", str(seed), "--domain", domain]
+    if skip_trained:
+        argv.append("--skip-trained")
+    if output:
+        argv.extend(["--output", output])
+    sys.exit(eval_main(argv))
+
+
 if __name__ == "__main__":
     cli()
