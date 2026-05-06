@@ -652,6 +652,7 @@ def read_with_consensus(
         strategy=strategy,
         content_type=content_type,
         quality_assessment=quality_assessment,
+        writer_profile=writer_profile_dict,
     )
 
 
