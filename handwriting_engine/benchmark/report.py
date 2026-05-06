@@ -18,6 +18,18 @@ from handwriting_engine.benchmark.db import (
 )
 from handwriting_engine.benchmark.evaluate import estimate_cost
 from handwriting_engine.benchmark.models import StrategyResult
+from handwriting_engine.benchmark.stats import (
+    bootstrap_ci,
+    cohens_r,
+    wilcoxon_signed_rank,
+)
+
+
+# Minimum paired-sample count for the statistics layer to attach. Below this,
+# normal-approximation Wilcoxon is too rough and bootstrap CIs are dominated
+# by sampling noise — better to print nothing than to print a misleading
+# p-value. Aligns with Phase 8 success criterion #1.
+_STATS_MIN_PAIRED_N = 10
 
 
 def _aggregate_results(rows: list[dict]) -> list[StrategyResult]:
@@ -183,12 +195,49 @@ def _format_csv(results: list[StrategyResult]) -> str:
     return output.getvalue().strip()
 
 
+def _paired_cers(
+    rows_1: list[dict],
+    rows_2: list[dict],
+    provider: str,
+    strategy: str,
+) -> tuple[list[float], list[float]]:
+    """Pair per-sample CERs from two runs by sample_id, restricted to the
+    given (provider, strategy). Order is sample_id-sorted and identical
+    on both sides — that's what makes the test paired."""
+    by_sample_1 = {
+        r["sample_id"]: r["cer"]
+        for r in rows_1
+        if r.get("provider") == provider
+        and r.get("strategy") == strategy
+        and r.get("cer") is not None
+    }
+    by_sample_2 = {
+        r["sample_id"]: r["cer"]
+        for r in rows_2
+        if r.get("provider") == provider
+        and r.get("strategy") == strategy
+        and r.get("cer") is not None
+    }
+    shared = sorted(set(by_sample_1) & set(by_sample_2))
+    return ([by_sample_1[sid] for sid in shared],
+            [by_sample_2[sid] for sid in shared])
+
+
 def compare_runs(
     run_id_1: int,
     run_id_2: int,
     db_path: Path | str | None = None,
 ) -> str:
-    """Compare two benchmark runs side by side."""
+    """Compare two benchmark runs side by side.
+
+    For each (provider, strategy) pair shared between the runs, when the
+    paired sample count is >= 10 the output appends:
+    - paired Wilcoxon signed-rank p-value and z-score
+    - Cohen's r effect size
+    - 95% bootstrap CIs for each run's CER
+
+    Pairing is by sample_id — same image, different run.
+    """
     conn = get_connection(db_path)
     try:
         rows_1 = get_run_results(conn, run_id_1)
@@ -233,6 +282,26 @@ def compare_runs(
                 f"{provider:<20} {strategy:<10} {r1.mean_cer:>7.2%} {r2.mean_cer:>7.2%} "
                 f"{delta:>+7.2%} {status:>12}"
             )
+
+            paired_a, paired_b = _paired_cers(rows_1, rows_2, provider, strategy)
+            if len(paired_a) >= _STATS_MIN_PAIRED_N:
+                wilcox = wilcoxon_signed_rank(paired_a, paired_b)
+                r_effect = cohens_r(wilcox.z, wilcox.n)
+                lo_a, hi_a = bootstrap_ci(paired_a, seed=run_id_1)
+                lo_b, hi_b = bootstrap_ci(paired_b, seed=run_id_2)
+                lines.append(
+                    f"{'  stats:':<31} "
+                    f"n={wilcox.n} "
+                    f"W={wilcox.statistic:.1f} "
+                    f"z={wilcox.z:+.2f} "
+                    f"p={wilcox.p_value:.4f} "
+                    f"r={r_effect:.2f}"
+                )
+                lines.append(
+                    f"{'  CI95:':<31} "
+                    f"run#{run_id_1} [{lo_a:.2%}, {hi_a:.2%}]  "
+                    f"run#{run_id_2} [{lo_b:.2%}, {hi_b:.2%}]"
+                )
         elif r1 and not r2:
             cer_str = f"{r1.mean_cer:>7.2%}" if r1.mean_cer >= 0 else "    N/A"
             lines.append(f"{provider:<20} {strategy:<10} {cer_str} {'---':>8} {'---':>8} {'removed':>12}")

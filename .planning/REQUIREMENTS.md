@@ -63,8 +63,8 @@ Requirements for the benchmarking milestone. Each maps to a roadmap phase.
 | IAM-01 | Phase 7 | Complete |
 | IAM-02 | Phase 7 | Pending |
 | IAM-03 | Phase 7 | Pending |
-| STAT-01 | Phase 8 | Pending |
-| STAT-02 | Phase 8 | Pending |
+| STAT-01 | Phase 8 | Implemented (verification gated on IAM data) |
+| STAT-02 | Phase 8 | Implemented (verification gated on IAM data) |
 | RPT-01 | Phase 9 | Pending |
 | RPT-02 | Phase 9 | Pending |
 | RPT-03 | Phase 9 | Pending |
