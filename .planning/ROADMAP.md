@@ -24,7 +24,7 @@ Full details: `.planning/milestones/v2.0-ROADMAP.md`
 
 - [x] **Phase 6: Measurement Foundation** — Reproducible baseline + variance floor + cost guardrails (completed 2026-04-11)
 - [x] **Phase 7: IAM Data Ingestion + Sweep Infrastructure** — Full IAM benchmark pipeline (completed 2026-05-06)
-- [ ] **Phase 8: Statistics Layer** — Statistical defensibility for all comparisons (blocked on user IAM download + first sweep run; see `.planning/NEXT-STEPS.md`)
+- [ ] **Phase 8: Statistics Layer** — Statistical defensibility for all comparisons (implementation shipped 2026-05-06; criterion verification gated on user IAM download + first sweep run; see `.planning/NEXT-STEPS.md`)
 - [ ] **Phase 9: Final Sweep, Recommendation, and Baseline Lock** — Best config identified, regression anchor committed
 
 ## Phase Details
@@ -42,9 +42,9 @@ Full details: `.planning/milestones/v2.0-ROADMAP.md`
 
 Plans:
 - [x] 06-01-PLAN.md — Wave 0 test stubs: failing tests for all Phase 6 behaviors (FOUND-01 through FOUND-04) (completed 2026-04-11)
-- [ ] 06-02-PLAN.md — v4 schema migration + dataclass extensions (db.py, models.py)
-- [x] 06-03-PLAN.md — Provenance capture + marker rate computation + report display (evaluate.py, report.py)
-- [ ] 06-04-PLAN.md — CLI surface: benchmark calibrate subcommand + cost guardrail + provenance flags (cli.py)
+- [x] 06-02-PLAN.md — v4 schema migration + dataclass extensions (db.py, models.py) (completed 2026-04-11)
+- [x] 06-03-PLAN.md — Provenance capture + marker rate computation + report display (evaluate.py, report.py) (completed 2026-04-11)
+- [x] 06-04-PLAN.md — CLI surface: benchmark calibrate subcommand + cost guardrail + provenance flags (cli.py) (completed 2026-04-11)
 
 ### Phase 7: IAM Data Ingestion + Sweep Infrastructure
 **Goal**: The developer can load the IAM Handwriting Database into the benchmark system and execute a full multi-strategy sweep against it, with per-writer variance visible in reports.
@@ -69,7 +69,10 @@ Plans:
 **Success Criteria** (what must be TRUE when this phase completes):
   1. Running `benchmark compare RUN_A RUN_B` on any two runs with n >= 10 samples automatically appends a Wilcoxon signed-rank p-value and Cohen's r effect size to the output, with no extra flags needed.
   2. The same `benchmark compare` output includes 95% bootstrap confidence intervals on both CER estimates, so the developer can see whether the CI bands overlap and judge whether the difference is distinguishable from sampling noise.
-**Plans**: TBD
+**Plans**: 1 plan
+
+Plans:
+- [x] 08-01-PLAN.md — Stats module + compare_runs wire-up: paired Wilcoxon, percentile bootstrap CI, Cohen's r (no scipy dep) (completed 2026-05-06; criterion verification gated on IAM data)
 
 ### Phase 9: Final Sweep, Recommendation, and Baseline Lock
 **Goal**: The developer knows which strategy+provider configuration is best for lab notebook grading, and a regression baseline is pinned so any future code change that silently degrades accuracy is immediately detectable.
