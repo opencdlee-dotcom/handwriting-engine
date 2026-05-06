@@ -235,6 +235,7 @@ def read_with_consensus(
     quality_assessment: dict | None = None,
     max_self_correct_rounds: int = 1,
     uncertainty_threshold: int = 3,
+    writer_profile: dict | None = None,
 ) -> ConsensusResult:
     """
     Read an image using multiple models and combine results.
@@ -258,7 +259,7 @@ def read_with_consensus(
     if strategy == "best_of":
         return _best_of(image_b64, media_type, prompt, system_prompt, content_type, max_tokens)
     elif strategy == "vote":
-        return _vote(image_b64, media_type, prompt, system_prompt, providers, confidence_threshold, content_type, max_tokens)
+        return _vote(image_b64, media_type, prompt, system_prompt, providers, confidence_threshold, content_type, max_tokens, writer_profile=writer_profile)
     elif strategy == "debate":
         return _debate(image_b64, media_type, prompt, system_prompt, providers, max_tokens, max_debate_rounds)
     elif strategy == "cascade":
@@ -268,8 +269,8 @@ def read_with_consensus(
     elif strategy == "smart":
         if quality_assessment is None:
             # No quality data — fall back to vote
-            return _vote(image_b64, media_type, prompt, system_prompt, providers, confidence_threshold, content_type, max_tokens)
-        return _smart_route(image_b64, media_type, prompt, system_prompt, quality_assessment, content_type, max_tokens, uncertainty_threshold)
+            return _vote(image_b64, media_type, prompt, system_prompt, providers, confidence_threshold, content_type, max_tokens, writer_profile=writer_profile)
+        return _smart_route(image_b64, media_type, prompt, system_prompt, quality_assessment, content_type, max_tokens, uncertainty_threshold, writer_profile=writer_profile)
     else:
         raise ValueError(f"Unknown strategy: {strategy}. Use: vote, best_of, debate, cascade, smart, self_correct")
 
@@ -418,6 +419,7 @@ def _vote(
     image_b64: str, media_type: str, prompt: str, system_prompt: str,
     providers: list[str] | None, confidence_threshold: float,
     content_type: str = "default", max_tokens: int = 4096,
+    *, writer_profile: dict | None = None,
 ) -> ConsensusResult:
     """Send to N providers, word-level majority vote.
 
@@ -564,7 +566,7 @@ def _vote(
         provider_weights.append((name, base_weight * confidence_scale))
 
     best_text, disagreements, confidence = _word_level_vote(
-        texts, provider_weights,
+        texts, provider_weights, writer_profile=writer_profile,
     )
 
     if excluded:
@@ -895,6 +897,7 @@ def _smart_route(
     image_b64: str, media_type: str, prompt: str, system_prompt: str,
     quality_assessment: dict, content_type: str, max_tokens: int,
     uncertainty_threshold: int = 3,
+    *, writer_profile: dict | None = None,
 ) -> ConsensusResult:
     """Adaptive routing based on image quality — spend API calls where they matter.
 
@@ -954,7 +957,7 @@ def _smart_route(
 
     else:
         # Hard: full vote with all available providers
-        return _vote(image_b64, media_type, prompt, system_prompt, None, 0.8, content_type, max_tokens)
+        return _vote(image_b64, media_type, prompt, system_prompt, None, 0.8, content_type, max_tokens, writer_profile=writer_profile)
 
 
 # ---------------------------------------------------------------------------

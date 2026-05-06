@@ -7,8 +7,6 @@ Falsifies:
 + supporting determinism, ordering, and length-mismatch tests
 """
 
-import pytest
-
 from handwriting_engine.consensus import (
     resolve_char_level,
     _word_level_vote,
@@ -124,3 +122,112 @@ class TestWordLevelVoteIntegration:
             writer_profile={"confusion_resolutions": {"rn↔m": "rn"}},
         )
         assert "rnodern" in text
+
+
+class TestWriterProfileEndToEndWireUp:
+    """End-to-end: writer_profile passed to consensus.read_with_consensus
+    must reach _word_level_vote unchanged (vote and smart strategies).
+
+    Direct text-level assertions are fragile here because provider weights
+    bias the vote independent of char-level resolution, so we instead probe
+    the _word_level_vote call and assert the kwarg arrived intact.
+    """
+
+    def _mock_provider(self, name, response):
+        from unittest.mock import MagicMock
+        mock = MagicMock()
+        mock.read_image.return_value = response
+        mock.usage = {}
+        mock.get_mean_confidence = MagicMock(return_value=0.0)
+        return mock
+
+    def test_vote_strategy_propagates_writer_profile(self):
+        from unittest.mock import patch
+        from handwriting_engine.consensus import read_with_consensus
+
+        providers_map = {
+            "openai": self._mock_provider("openai", "the modern cell"),
+            "claude": self._mock_provider("claude", "the rnodern cell"),
+        }
+        captured: dict = {}
+
+        def _spy(*args, **kwargs):
+            captured["writer_profile"] = kwargs.get("writer_profile")
+            return ("the modern cell", [], 0.95)
+
+        with patch("handwriting_engine.consensus.available_providers",
+                   return_value=["openai", "claude"]), \
+             patch("handwriting_engine.consensus.get_provider",
+                   side_effect=lambda n: providers_map[n]), \
+             patch("handwriting_engine.consensus._word_level_vote",
+                   side_effect=_spy):
+            read_with_consensus(
+                "b64", "image/jpeg", "read", strategy="vote",
+                content_type="handwriting",
+                writer_profile={"confusion_resolutions": {"rn↔m": "rn"}},
+            )
+
+        assert captured["writer_profile"] == {
+            "confusion_resolutions": {"rn↔m": "rn"}
+        }
+
+    def test_smart_strategy_no_quality_propagates_writer_profile(self):
+        # smart with quality_assessment=None falls back to vote internally.
+        from unittest.mock import patch
+        from handwriting_engine.consensus import read_with_consensus
+
+        providers_map = {
+            "openai": self._mock_provider("openai", "the modern cell"),
+            "claude": self._mock_provider("claude", "the rnodern cell"),
+        }
+        captured: dict = {}
+
+        def _spy(*args, **kwargs):
+            captured["writer_profile"] = kwargs.get("writer_profile")
+            return ("the modern cell", [], 0.95)
+
+        with patch("handwriting_engine.consensus.available_providers",
+                   return_value=["openai", "claude"]), \
+             patch("handwriting_engine.consensus.get_provider",
+                   side_effect=lambda n: providers_map[n]), \
+             patch("handwriting_engine.consensus._word_level_vote",
+                   side_effect=_spy):
+            read_with_consensus(
+                "b64", "image/jpeg", "read", strategy="smart",
+                content_type="handwriting",
+                writer_profile={"confusion_resolutions": {"rn↔m": "rn"}},
+            )
+
+        assert captured["writer_profile"] == {
+            "confusion_resolutions": {"rn↔m": "rn"}
+        }
+
+    def test_default_no_writer_profile_passes_none(self):
+        # Sanity: without writer_profile, the kwarg arrives as None
+        # (not as an empty dict or some other sentinel that would mask
+        # missing wires).
+        from unittest.mock import patch
+        from handwriting_engine.consensus import read_with_consensus
+
+        providers_map = {
+            "openai": self._mock_provider("openai", "the modern cell"),
+            "claude": self._mock_provider("claude", "the modern cell"),
+        }
+        captured: dict = {}
+
+        def _spy(*args, **kwargs):
+            captured["writer_profile"] = kwargs.get("writer_profile", "MISSING")
+            return ("the modern cell", [], 0.95)
+
+        with patch("handwriting_engine.consensus.available_providers",
+                   return_value=["openai", "claude"]), \
+             patch("handwriting_engine.consensus.get_provider",
+                   side_effect=lambda n: providers_map[n]), \
+             patch("handwriting_engine.consensus._word_level_vote",
+                   side_effect=_spy):
+            read_with_consensus(
+                "b64", "image/jpeg", "read", strategy="vote",
+                content_type="handwriting",
+            )
+
+        assert captured["writer_profile"] is None
