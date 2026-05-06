@@ -23,8 +23,8 @@ Full details: `.planning/milestones/v2.0-ROADMAP.md`
 ### v3.0 — Verified Accuracy
 
 - [x] **Phase 6: Measurement Foundation** — Reproducible baseline + variance floor + cost guardrails (completed 2026-04-11)
-- [ ] **Phase 7: IAM Data Ingestion + Sweep Infrastructure** — Full IAM benchmark pipeline
-- [ ] **Phase 8: Statistics Layer** — Statistical defensibility for all comparisons
+- [x] **Phase 7: IAM Data Ingestion + Sweep Infrastructure** — Full IAM benchmark pipeline (completed 2026-05-06)
+- [ ] **Phase 8: Statistics Layer** — Statistical defensibility for all comparisons (blocked on user IAM download + first sweep run; see `.planning/NEXT-STEPS.md`)
 - [ ] **Phase 9: Final Sweep, Recommendation, and Baseline Lock** — Best config identified, regression anchor committed
 
 ## Phase Details
@@ -57,10 +57,10 @@ Plans:
 **Plans**: 4 plans
 
 Plans:
-- [ ] 07-01-PLAN.md — Wave 0 RED test stubs: 16 failing tests across TestIAMIngest, TestSweep, TestPerWriterReport (IAM-01, IAM-02, IAM-03)
-- [ ] 07-02-PLAN.md — IAM ingest infrastructure: parse_iam_lines(), ingest_iam(), benchmark ingest-iam CLI (IAM-01)
-- [ ] 07-03-PLAN.md — Sweep infrastructure: line_level/auto_retry threading, run_sweep(), benchmark sweep CLI (IAM-02)
-- [ ] 07-04-PLAN.md — Per-writer report: generate_per_writer_report(), benchmark report --per-writer flag (IAM-03)
+- [x] 07-01-PLAN.md — Wave 0 RED test stubs: 17 failing tests across TestIAMIngest, TestSweep, TestPerWriterReport (IAM-01, IAM-02, IAM-03) (completed 2026-04-11)
+- [x] 07-02-PLAN.md — IAM ingest infrastructure: parse_iam_lines(), ingest_iam(), benchmark ingest-iam CLI (IAM-01) (completed 2026-04-12)
+- [x] 07-03-PLAN.md — Sweep infrastructure: line_level/auto_retry threading, run_sweep(), benchmark sweep CLI (IAM-02) (completed 2026-05-06)
+- [x] 07-04-PLAN.md — Per-writer report: generate_per_writer_report(), benchmark report --per-writer flag (IAM-03) (completed 2026-05-06)
 
 ### Phase 8: Statistics Layer
 **Goal**: CER comparisons between strategies are statistically defensible — not just raw delta numbers — so the developer can assert with confidence that a measured improvement is real.
@@ -91,6 +91,6 @@ Plans:
 | 4. Preprocessing + Writer Adaptation | v2.0 | 1/1 | ✅ Complete | 2026-04-09 |
 | 5. Post-Processing + Benchmark Suite | v2.0 | 1/1 | ✅ Complete | 2026-04-09 |
 | 6. Measurement Foundation | 4/4 | Complete    | 2026-04-11 | - |
-| 7. IAM Data Ingestion + Sweep Infrastructure | 1/4 | In Progress|  | - |
-| 8. Statistics Layer | v3.0 | 0/? | Not started | - |
+| 7. IAM Data Ingestion + Sweep Infrastructure | v3.0 | 4/4 | ✅ Complete | 2026-05-06 |
+| 8. Statistics Layer | v3.0 | 0/? | Blocked on user IAM download + first sweep | - |
 | 9. Final Sweep, Recommendation, and Baseline Lock | v3.0 | 0/? | Not started | - |
