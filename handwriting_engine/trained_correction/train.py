@@ -88,6 +88,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--save-steps", type=int, default=500)
     parser.add_argument("--no-system-wordlist", action="store_true",
                         help="Skip /usr/share/dict/words for general English")
+    parser.add_argument("--from-benchmark-db", action="store_true",
+                        help="Mix real (VLM_output, ground_truth) pairs from "
+                             "~/.handwriting-engine/benchmark.db into the training corpus. "
+                             "Real pairs are duplicated 3x relative to synthetic to up-weight "
+                             "the real distribution. No-op if the DB doesn't exist.")
+    parser.add_argument("--benchmark-db-path", default=None,
+                        help="Override the default benchmark.db path")
+    parser.add_argument("--benchmark-providers", default=None,
+                        help="Comma-separated list of providers to include "
+                             "(e.g. 'gemini,claude'). Default: all providers.")
+    parser.add_argument("--real-data-weight", type=int, default=3,
+                        help="How many times each real pair appears in the corpus "
+                             "relative to synthetic. Default 3.")
+    parser.add_argument("--continue-from", default=None,
+                        help="Path to an existing checkpoint to continue fine-tuning from. "
+                             "Overrides --model-name. Use to fine-tune the synthetic v0 "
+                             "model on real Phase 7 IAM data.")
     parser.add_argument("--quick", action="store_true",
                         help="Tiny run for smoke-testing the pipeline")
     args = parser.parse_args(argv)
@@ -120,6 +137,7 @@ def main(argv: list[str] | None = None) -> int:
 
     from handwriting_engine.trained_correction.dataset import (
         build_pairs,
+        from_benchmark_db,
         split_pairs,
         make_torch_dataset,
     )
@@ -135,6 +153,29 @@ def main(argv: list[str] | None = None) -> int:
         use_paragraphs=True,
         use_system_wordlist=not args.no_system_wordlist,
     )
+
+    real_pairs_count = 0
+    if args.from_benchmark_db:
+        providers_filter = (
+            [p.strip() for p in args.benchmark_providers.split(",") if p.strip()]
+            if args.benchmark_providers else None
+        )
+        real_pairs = from_benchmark_db(
+            db_path=args.benchmark_db_path,
+            providers=providers_filter,
+        )
+        if real_pairs:
+            real_pairs_count = len(real_pairs)
+            # Up-weight real pairs by replication; mixing into synthetic at higher
+            # weight encourages the model to track real-world distribution.
+            pairs = pairs + real_pairs * args.real_data_weight
+            logger.info(
+                "Mixed in %d real pairs (replicated %dx → %d effective real examples)",
+                real_pairs_count, args.real_data_weight, real_pairs_count * args.real_data_weight,
+            )
+        else:
+            logger.info("No real pairs available (DB empty or missing); using synthetic only")
+
     train_pairs, val_pairs, test_pairs = split_pairs(
         pairs,
         val_frac=args.val_frac,
@@ -144,9 +185,13 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("Train: %d  Val: %d  Test: %d", len(train_pairs), len(val_pairs), len(test_pairs))
 
     # ---- Tokenizer + model ----
-    logger.info("Loading tokenizer + model: %s", args.model_name)
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    model = AutoModelForSeq2SeqLM.from_pretrained(args.model_name)
+    model_source = args.continue_from if args.continue_from else args.model_name
+    if args.continue_from:
+        logger.info("Continuing from checkpoint: %s", args.continue_from)
+    else:
+        logger.info("Loading tokenizer + model: %s", args.model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_source)
+    model = AutoModelForSeq2SeqLM.from_pretrained(model_source)
     model.to(device)
     model.train()
 
@@ -236,11 +281,15 @@ def main(argv: list[str] | None = None) -> int:
     final_train_loss = train_losses[-1] if train_losses else float("nan")
 
     # ---- Manifest ----
+    has_real = real_pairs_count > 0
     manifest = {
         "schema_version": 1,
         "base_model": args.model_name,
+        "continued_from": args.continue_from,
         "training": {
-            "num_pairs": args.num_pairs,
+            "num_pairs_synthetic": args.num_pairs,
+            "num_pairs_real": real_pairs_count,
+            "real_data_weight": args.real_data_weight if has_real else 0,
             "num_train": len(train_pairs),
             "num_val": len(val_pairs),
             "num_test": len(test_pairs),
@@ -259,14 +308,17 @@ def main(argv: list[str] | None = None) -> int:
             "best_val_loss": best_val_loss if best_val_loss != float("inf") else None,
         },
         "data_provenance": {
-            "source": "synthetic",
+            "source": "synthetic+real" if has_real else "synthetic",
             "corpus_version": "v0",
             "system_wordlist": not args.no_system_wordlist,
+            "real_pairs_from": args.benchmark_db_path or "~/.handwriting-engine/benchmark.db" if has_real else None,
         },
-        "caveats": [
-            "Synthetic-only training — has known sim-to-real gap.",
-            "Plan a small real-data fine-tune (Phase 7 IAM data) before claiming production parity.",
-        ],
+        "caveats": (
+            ["Synthetic+real training — sim-to-real gap reduced by mixing real Phase 7 pairs."]
+            if has_real else
+            ["Synthetic-only training — has known sim-to-real gap.",
+             "Plan a small real-data fine-tune (Phase 7 IAM data) before claiming production parity."]
+        ),
     }
 
     # ---- Hold-out test loss ----

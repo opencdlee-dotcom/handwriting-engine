@@ -55,21 +55,28 @@ def cer(prediction: str, reference: str) -> float:
 @dataclass
 class EvalResult:
     n: int
-    avg_cer_input: float       # CER of corrupted vs clean (baseline)
-    avg_cer_heuristic: float   # CER after heuristic correction
-    avg_cer_trained: float     # CER after trained correction
-    avg_cer_combined: float    # CER after heuristic THEN trained correction
+    avg_cer_input: float          # CER of corrupted vs clean (baseline)
+    avg_cer_heuristic: float      # CER after heuristic correction
+    avg_cer_trained: float        # CER after trained correction (raw, no gates)
+    avg_cer_combined: float       # CER after heuristic THEN trained (raw, no gates)
+    avg_cer_combined_gated: float # CER after heuristic + trained with confidence gate + fidelity check
+    fidelity_rejections: int      # how many times the fidelity check fired
+    confidence_skips: int         # how many times the confidence gate skipped trained pass
 
     def to_dict(self) -> dict:
         return {
             "n": self.n,
             "avg_cer_input": round(self.avg_cer_input, 4),
             "avg_cer_heuristic": round(self.avg_cer_heuristic, 4),
-            "avg_cer_trained": round(self.avg_cer_trained, 4),
-            "avg_cer_combined": round(self.avg_cer_combined, 4),
+            "avg_cer_trained_raw": round(self.avg_cer_trained, 4),
+            "avg_cer_combined_raw": round(self.avg_cer_combined, 4),
+            "avg_cer_combined_gated": round(self.avg_cer_combined_gated, 4),
             "delta_heuristic_vs_input": round(self.avg_cer_heuristic - self.avg_cer_input, 4),
-            "delta_trained_vs_heuristic": round(self.avg_cer_trained - self.avg_cer_heuristic, 4),
-            "delta_combined_vs_heuristic": round(self.avg_cer_combined - self.avg_cer_heuristic, 4),
+            "delta_combined_raw_vs_heuristic": round(self.avg_cer_combined - self.avg_cer_heuristic, 4),
+            "delta_combined_gated_vs_heuristic": round(self.avg_cer_combined_gated - self.avg_cer_heuristic, 4),
+            "delta_gated_vs_raw": round(self.avg_cer_combined_gated - self.avg_cer_combined, 4),
+            "fidelity_rejections": self.fidelity_rejections,
+            "confidence_skips": self.confidence_skips,
         }
 
 
@@ -77,16 +84,27 @@ def evaluate(
     pairs: Iterable[tuple[str, str]],
     domain: str = "biology",
     skip_trained: bool = False,
+    fidelity_threshold: float = 0.35,
 ) -> EvalResult:
-    """Evaluate all four pipelines on each (corrupted, clean) pair."""
+    """Evaluate all four pipelines on each (corrupted, clean) pair.
+
+    Tracks both raw combined (heuristic → trained, no safeguards) and
+    gated combined (with confidence gate + fidelity check) so callers can
+    see what each safeguard buys.
+    """
     pairs = list(pairs)
     if not pairs:
-        return EvalResult(0, 0.0, 0.0, 0.0, 0.0)
+        return EvalResult(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0)
+
+    from handwriting_engine.postprocess import _change_ratio
 
     cer_in = []
     cer_heur = []
     cer_trained = []
     cer_combined = []
+    cer_combined_gated = []
+    fidelity_rejections = 0
+    confidence_skips = 0
 
     # Lazy: trained corrector loads on first call
     trained_corrector = None
@@ -106,11 +124,26 @@ def evaluate(
         if trained_corrector is not None:
             tr = trained_corrector.correct(corrupted)
             cer_trained.append(cer(tr, clean))
-            both = trained_corrector.correct(heur)
-            cer_combined.append(cer(both, clean))
+            both_raw = trained_corrector.correct(heur)
+            cer_combined.append(cer(both_raw, clean))
+
+            # Gated combined: confidence gate + fidelity check
+            heuristic_made_changes = heur != corrupted
+            if not heuristic_made_changes:
+                # Confidence gate: skip trained pass
+                gated = heur
+                confidence_skips += 1
+            else:
+                if _change_ratio(heur, both_raw) > fidelity_threshold:
+                    gated = heur
+                    fidelity_rejections += 1
+                else:
+                    gated = both_raw
+            cer_combined_gated.append(cer(gated, clean))
         else:
-            cer_trained.append(cer_in[-1])      # no-op fallback
+            cer_trained.append(cer_in[-1])
             cer_combined.append(cer_heur[-1])
+            cer_combined_gated.append(cer_heur[-1])
 
         if (i + 1) % 100 == 0:
             logger.info("Evaluated %d / %d", i + 1, len(pairs))
@@ -122,6 +155,9 @@ def evaluate(
         avg_cer_heuristic=sum(cer_heur) / n,
         avg_cer_trained=sum(cer_trained) / n,
         avg_cer_combined=sum(cer_combined) / n,
+        avg_cer_combined_gated=sum(cer_combined_gated) / n,
+        fidelity_rejections=fidelity_rejections,
+        confidence_skips=confidence_skips,
     )
 
 

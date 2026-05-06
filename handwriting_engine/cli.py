@@ -583,7 +583,17 @@ def trained_correction_group():
 @click.option("--seed", default=42, type=int)
 @click.option("--quick", is_flag=True, help="Tiny smoke run")
 @click.option("--no-system-wordlist", is_flag=True)
-@click.option("--model-name", default="google/byt5-small", show_default=True)
+@click.option("--model-name", default="google/flan-t5-small", show_default=True)
+@click.option("--from-benchmark-db", is_flag=True,
+              help="Mix real (VLM_output, ground_truth) pairs from the benchmark DB")
+@click.option("--benchmark-db-path", default=None, type=click.Path(),
+              help="Override the default benchmark.db path")
+@click.option("--benchmark-providers", default=None,
+              help="Comma-separated provider filter (e.g. 'gemini,claude')")
+@click.option("--real-data-weight", default=3, type=int,
+              help="Replication factor for real pairs (default 3)")
+@click.option("--continue-from", default=None, type=click.Path(),
+              help="Continue fine-tuning from an existing checkpoint")
 def trained_correction_train(**kwargs):
     """Fine-tune the synthetic-data corrector. Long-running."""
     from handwriting_engine.trained_correction.train import main as train_main
