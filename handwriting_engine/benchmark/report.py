@@ -319,11 +319,18 @@ def detect_regressions(
     threshold: float = 0.03,
     db_path: Path | str | None = None,
 ) -> list[dict]:
-    """Compare latest run against previous run. Returns list of regressions.
+    """Compare a run against the pinned baseline. Returns list of regressions.
+
+    Phase 9 / RPT-01: anchor is the run pinned via `benchmark set-baseline`.
+    Falls back to the previous run when no baseline is pinned, preserving
+    pre-Phase-9 behavior on a freshly-initialized DB. Excludes self-compare
+    when the current run IS the baseline.
 
     Default threshold is 3% — with small sample sizes (<30), differences
     below this are within the noise floor and not meaningful.
     """
+    from handwriting_engine.benchmark.db import get_baseline_run_id
+
     conn = get_connection(db_path)
     try:
         runs = list_runs(conn)
@@ -333,13 +340,21 @@ def detect_regressions(
 
         if run_id is None:
             current = runs[0]
-            previous = runs[1]
         else:
             current = next((r for r in runs if r.run_id == run_id), None)
-            idx = next((i for i, r in enumerate(runs) if r.run_id == run_id), None)
+        if not current:
+            return []
+
+        baseline_run_id = get_baseline_run_id(conn)
+        if baseline_run_id is not None and baseline_run_id != current.run_id:
+            previous = next((r for r in runs if r.run_id == baseline_run_id), None)
+        else:
+            # No pinned baseline (or current IS the baseline) — use the run
+            # immediately preceding `current`, matching pre-Phase-9 behavior.
+            idx = next((i for i, r in enumerate(runs) if r.run_id == current.run_id), None)
             previous = runs[idx + 1] if idx is not None and idx + 1 < len(runs) else None
 
-        if not current or not previous:
+        if not previous:
             return []
 
         rows_curr = get_run_results(conn, current.run_id)

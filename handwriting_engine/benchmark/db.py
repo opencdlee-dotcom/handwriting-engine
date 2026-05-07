@@ -73,7 +73,8 @@ CREATE TABLE IF NOT EXISTS runs (
     model_version    TEXT DEFAULT NULL,
     iam_partition    TEXT DEFAULT NULL,
     norm_flags       TEXT DEFAULT NULL,
-    vocab_hints_off  INTEGER DEFAULT 0
+    vocab_hints_off  INTEGER DEFAULT 0,
+    is_baseline      INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS provider_outputs (
@@ -161,6 +162,11 @@ _MIGRATIONS: dict[int, str] = {
         );
         CREATE INDEX IF NOT EXISTS idx_corrections_sample ON corrections(sample_id);
         UPDATE schema_version SET version = 5;
+    """,
+    # v6: Add is_baseline flag to runs (Phase 9 / RPT-01)
+    6: """
+        ALTER TABLE runs ADD COLUMN is_baseline INTEGER DEFAULT 0;
+        UPDATE schema_version SET version = 6;
     """,
 }
 
@@ -439,8 +445,38 @@ def list_runs(conn: sqlite3.Connection) -> list[RunSummary]:
             iam_partition=r["iam_partition"] if "iam_partition" in keys else None,
             norm_flags=r["norm_flags"] if "norm_flags" in keys else None,
             vocab_hints_off=r["vocab_hints_off"] if "vocab_hints_off" in keys else 0,
+            is_baseline=r["is_baseline"] if "is_baseline" in keys else 0,
         ))
     return results
+
+
+# --- Baseline pinning (Phase 9 / RPT-01) ---
+
+
+def set_baseline(conn: sqlite3.Connection, run_id: int) -> None:
+    """Pin a run as the regression-detection anchor.
+
+    Atomically clears the flag on every other run, then sets it on the
+    target. Multiple baselines is a footgun (which one does
+    detect_regressions compare against?), so we enforce at-most-one here
+    rather than via a partial-unique index.
+
+    Raises ValueError if the run does not exist.
+    """
+    row = conn.execute("SELECT 1 FROM runs WHERE id = ?", (run_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"run {run_id} not found")
+    conn.execute("UPDATE runs SET is_baseline = 0")
+    conn.execute("UPDATE runs SET is_baseline = 1 WHERE id = ?", (run_id,))
+    conn.commit()
+
+
+def get_baseline_run_id(conn: sqlite3.Connection) -> int | None:
+    """Return the pinned baseline run_id, or None if no run is pinned."""
+    row = conn.execute(
+        "SELECT id FROM runs WHERE is_baseline = 1 ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    return row["id"] if row else None
 
 
 # --- Provider Outputs ---

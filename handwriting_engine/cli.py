@@ -589,6 +589,30 @@ def benchmark_compare_cmd(run_id_1, run_id_2):
     click.echo(compare_runs(run_id_1, run_id_2))
 
 
+@benchmark.command("set-baseline")
+@click.argument("run_id", type=int)
+@click.option("--db-path", default=None, type=click.Path(),
+              help="Override database path (default: ~/.handwriting-engine/benchmark.db).")
+def benchmark_set_baseline_cmd(run_id, db_path):
+    """Pin RUN_ID as the regression-detection anchor.
+
+    `detect_regressions` and `benchmark report` then compare future runs
+    against this pinned run rather than the immediately-preceding run.
+    Exactly one run is the baseline at any time; this command atomically
+    clears the prior pin and sets the new one.
+    """
+    from handwriting_engine.benchmark.db import get_connection, set_baseline
+
+    conn = get_connection(db_path)
+    try:
+        set_baseline(conn, run_id)
+    except ValueError as e:
+        raise click.ClickException(str(e))
+    finally:
+        conn.close()
+    click.echo(f"Baseline pinned: run #{run_id}")
+
+
 @benchmark.command("drill-down")
 @click.argument("sample_id", type=int)
 @click.option("--run-id", "-r", default=None, type=int, help="Specific run (default: latest)")
