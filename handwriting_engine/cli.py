@@ -317,6 +317,53 @@ def benchmark_ingest_iam(ascii_dir, lines_dir, partition_file, all_partitions, d
         raise SystemExit(1)
 
 
+@benchmark.command("ingest-lab")
+@click.argument("directory", type=click.Path(exists=True, file_okay=False))
+@click.option("--student", "-s", default="lab", help="Student / author tag for these images")
+@click.option("--with-suggestion", is_flag=True, default=False,
+              help="Pre-fill each prompt with a single VLM read (costs ~$/image).")
+@click.option("--vlm-provider", default="gemini", show_default=True,
+              help="Provider for VLM suggestion (when --with-suggestion).")
+@click.option("--db-path", default=None, hidden=True)
+def benchmark_ingest_lab(directory, student, with_suggestion, vlm_provider, db_path):
+    """Guided annotation: capture ground-truth transcriptions for lab notebook images.
+
+    For each image in DIRECTORY, opens $EDITOR (or prompts inline) with an
+    optional VLM-suggested transcription. Save to record as ground truth;
+    leave empty / cancel to skip an image. Re-running on the same directory
+    skips images that already have ground truth — safe to resume.
+    """
+    from handwriting_engine.benchmark.ingest import ingest_lab
+
+    def _prompt(image_path: str, suggestion: str) -> str | None:
+        click.echo(f"\n--- {image_path} ---")
+        if suggestion:
+            click.echo(f"VLM suggestion: {suggestion}")
+        # click.edit returns None if EDITOR exits without saving (skip);
+        # otherwise it returns the buffer with trailing whitespace.
+        edited = click.edit(suggestion or "")
+        if edited is None:
+            return None
+        return edited.strip()
+
+    counts = ingest_lab(
+        directory,
+        student=student,
+        prompt_fn=_prompt,
+        db_path=db_path,
+        use_vlm_suggestion=with_suggestion,
+        vlm_provider=vlm_provider,
+    )
+    click.echo(
+        "\nLab ingest complete: "
+        f"{counts['annotated']} annotated, "
+        f"{counts['newly_added']} new samples, "
+        f"{counts['skipped_existing_gt']} already had ground truth, "
+        f"{counts['skipped_user']} skipped, "
+        f"{counts['errors']} errors."
+    )
+
+
 @benchmark.command("transcribe")
 @click.argument("sample_id", type=int)
 @click.option("--text", "-t", default=None, help="Ground truth transcription text")

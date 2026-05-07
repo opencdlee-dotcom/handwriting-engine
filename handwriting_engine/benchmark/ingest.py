@@ -50,6 +50,126 @@ def _extract_page_number(filename: str) -> int:
     return int(numbers[-1]) if numbers else 0
 
 
+def ingest_lab(
+    directory: str | Path,
+    *,
+    student: str = "",
+    prompt_fn=None,
+    db_path: Path | str | None = None,
+    use_vlm_suggestion: bool = False,
+    vlm_provider: str = "gemini",
+) -> dict:
+    """Guided ingest of student lab notebook images with ground-truth capture.
+
+    For each image in the directory:
+    1. Hash and dedup. If a sample already has ground truth, skip silently.
+    2. Insert the sample if new (category='lab').
+    3. Optionally pre-fill a VLM suggestion via a single-provider read.
+    4. Hand control to `prompt_fn(image_path, suggestion) -> str | None`.
+       - Return a non-empty string: stored as ground truth, source='lab-grader'.
+       - Return None or empty string: skip — sample stays in DB without GT.
+    5. Continue to the next image until done.
+
+    Args:
+        directory: Folder of student lab notebook images (jpg/png/etc).
+        student: Author / student tag stored on each sample (also recorded
+            on each ground_truth row's `author` column for provenance).
+        prompt_fn: Callable returning the transcription text or None.
+            Mandatory in non-interactive use; CLI wrapper supplies one
+            backed by click.edit() with an EDITOR fallback to click.prompt.
+        db_path: Override path.
+        use_vlm_suggestion: When True, run a single VLM read per image and
+            pass that text as the `suggestion` argument to prompt_fn. Costs
+            ~$0.0005-0.005 per image depending on provider.
+        vlm_provider: Provider used when use_vlm_suggestion is True.
+
+    Returns:
+        Dict with counts: {'annotated', 'skipped_existing_gt', 'skipped_user',
+                           'newly_added', 'errors'}.
+    """
+    if prompt_fn is None:
+        raise ValueError("ingest_lab requires a prompt_fn callable")
+
+    directory = Path(directory)
+    if not directory.is_dir():
+        raise FileNotFoundError(f"Not a directory: {directory}")
+
+    conn = get_connection(db_path)
+    counts = {
+        "annotated": 0,
+        "skipped_existing_gt": 0,
+        "skipped_user": 0,
+        "newly_added": 0,
+        "errors": 0,
+    }
+
+    try:
+        image_files = sorted(
+            f for f in directory.iterdir()
+            if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS
+        )
+        source_dir = str(directory.resolve())
+
+        for img_path in image_files:
+            img_hash = hash_file(img_path)
+            existing = get_sample_by_hash(conn, img_hash)
+
+            if existing:
+                # Skip silently if ground truth is already captured.
+                gt = conn.execute(
+                    "SELECT 1 FROM ground_truths WHERE sample_id = ? LIMIT 1",
+                    (existing.id,),
+                ).fetchone()
+                if gt:
+                    counts["skipped_existing_gt"] += 1
+                    continue
+                sample_id = existing.id
+            else:
+                page_num = _extract_page_number(img_path.stem)
+                try:
+                    sample_id = insert_sample(
+                        conn,
+                        image_path=str(img_path.resolve()),
+                        image_hash=img_hash,
+                        student=student,
+                        category="lab",
+                        source_dir=source_dir,
+                        page_number=page_num,
+                    )
+                    counts["newly_added"] += 1
+                except Exception as e:
+                    logger.warning("Failed to insert %s: %s", img_path.name, e)
+                    counts["errors"] += 1
+                    continue
+
+            suggestion = ""
+            if use_vlm_suggestion:
+                try:
+                    from handwriting_engine.vision import read_with_consensus
+                    result = read_with_consensus(
+                        str(img_path),
+                        providers=[vlm_provider],
+                        strategy="best_of",
+                    )
+                    suggestion = (result.text or "").strip()
+                except Exception as e:
+                    logger.warning("VLM suggestion failed for %s: %s", img_path.name, e)
+
+            text = prompt_fn(str(img_path), suggestion)
+            if text and text.strip():
+                insert_ground_truth(
+                    conn, sample_id, text.strip(),
+                    source="lab-grader", author=student,
+                )
+                counts["annotated"] += 1
+            else:
+                counts["skipped_user"] += 1
+    finally:
+        conn.close()
+
+    return counts
+
+
 def ingest_directory(
     directory: str | Path,
     student: str = "",
