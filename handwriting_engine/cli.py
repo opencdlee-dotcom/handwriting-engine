@@ -589,6 +589,21 @@ def benchmark_compare_cmd(run_id_1, run_id_2):
     click.echo(compare_runs(run_id_1, run_id_2))
 
 
+@benchmark.command("recommend")
+@click.option("--db-path", default=None, type=click.Path(),
+              help="Override database path (default: ~/.handwriting-engine/benchmark.db).")
+def benchmark_recommend_cmd(db_path):
+    """Recommend the best (provider, strategy) configuration.
+
+    Composite score: 70% CER, 15% cost, 15% stability across runs.
+    Each component is min-max normalized within the candidate set.
+    Single-run candidates get the median stability score (neutral).
+    """
+    from handwriting_engine.benchmark.report import recommend_strategy
+
+    click.echo(recommend_strategy(db_path=db_path))
+
+
 @benchmark.command("set-baseline")
 @click.argument("run_id", type=int)
 @click.option("--db-path", default=None, type=click.Path(),

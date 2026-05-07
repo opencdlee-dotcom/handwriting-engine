@@ -314,6 +314,139 @@ def compare_runs(
     return "\n".join(lines)
 
 
+# --- Phase 9 / RPT-02: configuration recommendation ---
+
+
+# Composite score weights. The contract from REQUIREMENTS.md is 70/15/15;
+# changing these is a product decision, not a code change.
+_RECOMMEND_W_CER = 0.70
+_RECOMMEND_W_COST = 0.15
+_RECOMMEND_W_STAB = 0.15
+
+
+def recommend_strategy(db_path: Path | str | None = None) -> str:
+    """Rank (provider, strategy) configurations by a composite score.
+
+    Score = 0.70 * (1 - cer_norm) + 0.15 * (1 - cost_norm) + 0.15 * stab_norm,
+    where each component is min-max normalized within the candidate set.
+    Lower CER and lower cost score higher; higher stability scores higher.
+
+    Stability is the inverse of CER stdev across runs of the same
+    (provider, strategy). When a candidate has only one run, it is given
+    the median stability score of the candidate set (neutral) and the
+    output flags it as `n=1`.
+
+    Returns a ranked human-readable table with the winner annotated.
+    """
+    conn = get_connection(db_path)
+    try:
+        runs = list_runs(conn)
+        if not runs:
+            return "No runs in database — nothing to recommend."
+
+        # Per-(provider, strategy) accumulator across all runs.
+        accum: dict[tuple[str, str], dict] = {}
+        for run in runs:
+            rows = get_run_results(conn, run.run_id)
+            for r in _aggregate_results(rows):
+                if r.mean_cer < 0:
+                    continue
+                key = (r.provider, r.strategy)
+                bucket = accum.setdefault(key, {
+                    "cers_per_run": [],
+                    "cost_per_sample_runs": [],
+                    "total_runs": 0,
+                })
+                bucket["cers_per_run"].append(r.mean_cer)
+                if r.sample_count > 0:
+                    bucket["cost_per_sample_runs"].append(
+                        r.estimated_cost_usd / r.sample_count
+                    )
+                bucket["total_runs"] += 1
+    finally:
+        conn.close()
+
+    if not accum:
+        return "No (provider, strategy) configurations with measured CER — nothing to recommend."
+
+    # Compute summary stats per candidate.
+    summaries: list[dict] = []
+    for (provider, strategy), bucket in accum.items():
+        cers = bucket["cers_per_run"]
+        costs = bucket["cost_per_sample_runs"]
+        n_runs = bucket["total_runs"]
+        mean_cer = sum(cers) / len(cers)
+        stdev_cer = statistics.stdev(cers) if len(cers) >= 2 else None
+        mean_cost = sum(costs) / len(costs) if costs else 0.0
+        summaries.append({
+            "provider": provider,
+            "strategy": strategy,
+            "n_runs": n_runs,
+            "mean_cer": mean_cer,
+            "stdev_cer": stdev_cer,
+            "mean_cost_per_sample": mean_cost,
+        })
+
+    # Normalize each component to [0, 1] within the candidate set.
+    cers = [s["mean_cer"] for s in summaries]
+    costs = [s["mean_cost_per_sample"] for s in summaries]
+    cer_min, cer_max = min(cers), max(cers)
+    cost_min, cost_max = min(costs), max(costs)
+
+    measured_stdevs = [s["stdev_cer"] for s in summaries if s["stdev_cer"] is not None]
+    median_stdev = statistics.median(measured_stdevs) if measured_stdevs else 0.0
+    stdevs_for_norm = [
+        s["stdev_cer"] if s["stdev_cer"] is not None else median_stdev
+        for s in summaries
+    ]
+    stdev_min, stdev_max = min(stdevs_for_norm), max(stdevs_for_norm)
+
+    def _norm(x: float, lo: float, hi: float) -> float:
+        if hi - lo < 1e-12:
+            return 0.5  # all candidates equal on this axis
+        return (x - lo) / (hi - lo)
+
+    for s, eff_stdev in zip(summaries, stdevs_for_norm):
+        cer_n = _norm(s["mean_cer"], cer_min, cer_max)
+        cost_n = _norm(s["mean_cost_per_sample"], cost_min, cost_max)
+        stab_n = 1.0 - _norm(eff_stdev, stdev_min, stdev_max)
+        s["score"] = (
+            _RECOMMEND_W_CER * (1.0 - cer_n)
+            + _RECOMMEND_W_COST * (1.0 - cost_n)
+            + _RECOMMEND_W_STAB * stab_n
+        )
+
+    summaries.sort(key=lambda s: s["score"], reverse=True)
+    winner = summaries[0]
+
+    lines = [
+        "Strategy + provider recommendation",
+        f"  weights: CER {_RECOMMEND_W_CER:.0%}  "
+        f"cost {_RECOMMEND_W_COST:.0%}  "
+        f"stability {_RECOMMEND_W_STAB:.0%}",
+        "",
+        f"  Winner: {winner['provider']} + {winner['strategy']}  "
+        f"(score {winner['score']:.3f})",
+        "",
+    ]
+    header = (
+        f"{'Rank':<4} {'Provider':<12} {'Strategy':<14} "
+        f"{'CER':>7} {'$/sample':>10} {'stdev':>9} {'n':>3} {'score':>7}"
+    )
+    lines.append(header)
+    lines.append("-" * len(header))
+
+    for rank, s in enumerate(summaries, start=1):
+        stdev_str = f"{s['stdev_cer']:.3f}" if s["stdev_cer"] is not None else "  n=1"
+        lines.append(
+            f"{rank:<4} {s['provider']:<12} {s['strategy']:<14} "
+            f"{s['mean_cer']:>6.2%} {s['mean_cost_per_sample']:>9.4f}$ "
+            f"{stdev_str:>9} {s['n_runs']:>3} {s['score']:>7.3f}"
+        )
+
+    return "\n".join(lines)
+
+
 def detect_regressions(
     run_id: int | None = None,
     threshold: float = 0.03,

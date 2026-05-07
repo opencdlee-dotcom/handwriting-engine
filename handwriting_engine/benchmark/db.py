@@ -20,7 +20,7 @@ from handwriting_engine.benchmark.models import (
 )
 
 DEFAULT_DB_PATH = Path.home() / ".handwriting-engine" / "benchmark.db"
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 6
 
 logger = logging.getLogger(__name__)
 
