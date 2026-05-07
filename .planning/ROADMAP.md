@@ -23,9 +23,9 @@ Full details: `.planning/milestones/v2.0-ROADMAP.md`
 ### v3.0 — Verified Accuracy
 
 - [x] **Phase 6: Measurement Foundation** — Reproducible baseline + variance floor + cost guardrails (completed 2026-04-11)
-- [ ] **Phase 7: IAM Data Ingestion + Sweep Infrastructure** — Full IAM benchmark pipeline
-- [ ] **Phase 8: Statistics Layer** — Statistical defensibility for all comparisons
-- [ ] **Phase 9: Final Sweep, Recommendation, and Baseline Lock** — Best config identified, regression anchor committed
+- [x] **Phase 7: IAM Data Ingestion + Sweep Infrastructure** — Full IAM benchmark pipeline (completed 2026-05-06)
+- [ ] **Phase 8: Statistics Layer** — Statistical defensibility for all comparisons (implementation shipped 2026-05-06; criterion verification gated on user IAM download + first sweep run; see `.planning/NEXT-STEPS.md`)
+- [ ] **Phase 9: Final Sweep, Recommendation, and Baseline Lock** — Best config identified, regression anchor committed (implementation shipped 2026-05-06; verification of "best config recommendation" gated on user IAM download + first multi-strategy sweep)
 
 ## Phase Details
 
@@ -42,9 +42,9 @@ Full details: `.planning/milestones/v2.0-ROADMAP.md`
 
 Plans:
 - [x] 06-01-PLAN.md — Wave 0 test stubs: failing tests for all Phase 6 behaviors (FOUND-01 through FOUND-04) (completed 2026-04-11)
-- [ ] 06-02-PLAN.md — v4 schema migration + dataclass extensions (db.py, models.py)
-- [x] 06-03-PLAN.md — Provenance capture + marker rate computation + report display (evaluate.py, report.py)
-- [ ] 06-04-PLAN.md — CLI surface: benchmark calibrate subcommand + cost guardrail + provenance flags (cli.py)
+- [x] 06-02-PLAN.md — v4 schema migration + dataclass extensions (db.py, models.py) (completed 2026-04-11)
+- [x] 06-03-PLAN.md — Provenance capture + marker rate computation + report display (evaluate.py, report.py) (completed 2026-04-11)
+- [x] 06-04-PLAN.md — CLI surface: benchmark calibrate subcommand + cost guardrail + provenance flags (cli.py) (completed 2026-04-11)
 
 ### Phase 7: IAM Data Ingestion + Sweep Infrastructure
 **Goal**: The developer can load the IAM Handwriting Database into the benchmark system and execute a full multi-strategy sweep against it, with per-writer variance visible in reports.
@@ -57,10 +57,10 @@ Plans:
 **Plans**: 4 plans
 
 Plans:
-- [ ] 07-01-PLAN.md — Wave 0 RED test stubs: 16 failing tests across TestIAMIngest, TestSweep, TestPerWriterReport (IAM-01, IAM-02, IAM-03)
-- [ ] 07-02-PLAN.md — IAM ingest infrastructure: parse_iam_lines(), ingest_iam(), benchmark ingest-iam CLI (IAM-01)
-- [ ] 07-03-PLAN.md — Sweep infrastructure: line_level/auto_retry threading, run_sweep(), benchmark sweep CLI (IAM-02)
-- [ ] 07-04-PLAN.md — Per-writer report: generate_per_writer_report(), benchmark report --per-writer flag (IAM-03)
+- [x] 07-01-PLAN.md — Wave 0 RED test stubs: 17 failing tests across TestIAMIngest, TestSweep, TestPerWriterReport (IAM-01, IAM-02, IAM-03) (completed 2026-04-11)
+- [x] 07-02-PLAN.md — IAM ingest infrastructure: parse_iam_lines(), ingest_iam(), benchmark ingest-iam CLI (IAM-01) (completed 2026-04-12)
+- [x] 07-03-PLAN.md — Sweep infrastructure: line_level/auto_retry threading, run_sweep(), benchmark sweep CLI (IAM-02) (completed 2026-05-06)
+- [x] 07-04-PLAN.md — Per-writer report: generate_per_writer_report(), benchmark report --per-writer flag (IAM-03) (completed 2026-05-06)
 
 ### Phase 8: Statistics Layer
 **Goal**: CER comparisons between strategies are statistically defensible — not just raw delta numbers — so the developer can assert with confidence that a measured improvement is real.
@@ -69,7 +69,10 @@ Plans:
 **Success Criteria** (what must be TRUE when this phase completes):
   1. Running `benchmark compare RUN_A RUN_B` on any two runs with n >= 10 samples automatically appends a Wilcoxon signed-rank p-value and Cohen's r effect size to the output, with no extra flags needed.
   2. The same `benchmark compare` output includes 95% bootstrap confidence intervals on both CER estimates, so the developer can see whether the CI bands overlap and judge whether the difference is distinguishable from sampling noise.
-**Plans**: TBD
+**Plans**: 1 plan
+
+Plans:
+- [x] 08-01-PLAN.md — Stats module + compare_runs wire-up: paired Wilcoxon, percentile bootstrap CI, Cohen's r (no scipy dep) (completed 2026-05-06; criterion verification gated on IAM data)
 
 ### Phase 9: Final Sweep, Recommendation, and Baseline Lock
 **Goal**: The developer knows which strategy+provider configuration is best for lab notebook grading, and a regression baseline is pinned so any future code change that silently degrades accuracy is immediately detectable.
@@ -79,7 +82,12 @@ Plans:
   1. Developer runs `benchmark set-baseline RUN_ID` to pin any run as the regression anchor; `detect_regressions()` then compares future runs against that pinned run (not the penultimate run), and the schema tracks the `is_baseline` flag durably across sessions.
   2. `benchmark recommend` outputs a single ranked recommendation with a composite score (70% CER / 15% cost / 15% stability) and the winning strategy+provider combination is unambiguous.
   3. Developer can run `benchmark ingest-lab` against real student lab notebook images and store ground-truth transcriptions via a guided annotation workflow, producing a production-distribution test set that is separate from IAM.
-**Plans**: TBD
+**Plans**: 3 plans
+
+Plans:
+- [x] 09-01-PLAN.md — Schema v6 is_baseline + set_baseline/get_baseline + detect_regressions retarget + CLI (RPT-01) (completed 2026-05-06)
+- [x] 09-02-PLAN.md — recommend_strategy() composite 70/15/15 score + CLI (RPT-02) (completed 2026-05-06; verification gated on multi-strategy IAM sweep)
+- [x] 09-03-PLAN.md — ingest_lab() guided annotation + CLI (RPT-03) (completed 2026-05-06)
 
 ## Progress
 
@@ -91,6 +99,6 @@ Plans:
 | 4. Preprocessing + Writer Adaptation | v2.0 | 1/1 | ✅ Complete | 2026-04-09 |
 | 5. Post-Processing + Benchmark Suite | v2.0 | 1/1 | ✅ Complete | 2026-04-09 |
 | 6. Measurement Foundation | 4/4 | Complete    | 2026-04-11 | - |
-| 7. IAM Data Ingestion + Sweep Infrastructure | 1/4 | In Progress|  | - |
-| 8. Statistics Layer | v3.0 | 0/? | Not started | - |
+| 7. IAM Data Ingestion + Sweep Infrastructure | v3.0 | 4/4 | ✅ Complete | 2026-05-06 |
+| 8. Statistics Layer | v3.0 | 0/? | Blocked on user IAM download + first sweep | - |
 | 9. Final Sweep, Recommendation, and Baseline Lock | v3.0 | 0/? | Not started | - |

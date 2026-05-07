@@ -27,9 +27,9 @@ Requirements for the benchmarking milestone. Each maps to a roadmap phase.
 
 ### Reporting
 
-- [ ] **RPT-01**: Schema v4 adds `is_baseline` flag to runs table; `benchmark set-baseline RUN_ID` pins a run as the regression anchor; `detect_regressions()` compares against the pinned baseline, not runs[-2].
-- [ ] **RPT-02**: `benchmark recommend` outputs the best strategy+provider configuration with a weighted composite score (70% CER / 15% cost / 15% stability across runs).
-- [ ] **RPT-03**: Developer can collect and store ground-truth transcriptions from real student lab notebooks using `benchmark ingest-lab` with a guided annotation workflow, enabling production-distribution benchmarks distinct from IAM.
+- [x] **RPT-01**: Schema v6 adds `is_baseline` flag to runs table; `benchmark set-baseline RUN_ID` pins a run as the regression anchor; `detect_regressions()` compares against the pinned baseline, not runs[-2]. (shipped 2026-05-06)
+- [x] **RPT-02**: `benchmark recommend` outputs the best strategy+provider configuration with a weighted composite score (70% CER / 15% cost / 15% stability across runs). (shipped 2026-05-06; end-to-end on multi-strategy sweep gated on IAM data)
+- [x] **RPT-03**: Developer can collect and store ground-truth transcriptions from real student lab notebooks using `benchmark ingest-lab` with a guided annotation workflow, enabling production-distribution benchmarks distinct from IAM. (shipped 2026-05-06)
 
 ## v4.0 Requirements (Deferred)
 
@@ -63,11 +63,11 @@ Requirements for the benchmarking milestone. Each maps to a roadmap phase.
 | IAM-01 | Phase 7 | Complete |
 | IAM-02 | Phase 7 | Pending |
 | IAM-03 | Phase 7 | Pending |
-| STAT-01 | Phase 8 | Pending |
-| STAT-02 | Phase 8 | Pending |
-| RPT-01 | Phase 9 | Pending |
-| RPT-02 | Phase 9 | Pending |
-| RPT-03 | Phase 9 | Pending |
+| STAT-01 | Phase 8 | Implemented (verification gated on IAM data) |
+| STAT-02 | Phase 8 | Implemented (verification gated on IAM data) |
+| RPT-01 | Phase 9 | Implemented |
+| RPT-02 | Phase 9 | Implemented (verification gated on IAM sweep) |
+| RPT-03 | Phase 9 | Implemented |
 
 **Coverage:**
 - v3.0 requirements: 12 total

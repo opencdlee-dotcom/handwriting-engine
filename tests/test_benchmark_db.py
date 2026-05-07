@@ -17,6 +17,7 @@ from handwriting_engine.benchmark.db import (
     insert_sample,
     list_runs,
     list_samples,
+    record_correction,
     samples_with_ground_truth,
 )
 
@@ -63,6 +64,17 @@ class TestSchemaCreation:
 
         po_cols = {row["name"] for row in db.execute("PRAGMA table_info(provider_outputs)").fetchall()}
         assert "question_marker_rate" in po_cols, "provider_outputs.question_marker_rate missing — v4 migration not applied"
+
+    def test_v5_corrections_table(self, db):
+        """v5 migration must create the corrections table with expected columns."""
+        tables = {r["name"] for r in db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        assert "corrections" in tables, "corrections table missing — v5 migration not applied"
+
+        cols = {r["name"] for r in db.execute("PRAGMA table_info(corrections)").fetchall()}
+        for required in {"sample_id", "ground_truth_id", "original_text", "confidence", "source", "created_at"}:
+            assert required in cols, f"corrections.{required} missing"
 
 
 class TestSamples:
@@ -206,3 +218,90 @@ class TestProviderOutputsAndMetrics:
         assert len(results) == 1
         assert results[0]["provider"] == "gemini"
         assert results[0]["cer"] == 0.0
+
+
+class TestCorrections:
+    """S4: record_correction() instructor-feedback API."""
+
+    @pytest.fixture
+    def fake_image(self, tmp_path):
+        path = tmp_path / "page.png"
+        path.write_bytes(b"\x89PNG\r\n\x1a\nfake-image-bytes-for-hashing")
+        return str(path)
+
+    def test_first_call_creates_sample_gt_and_correction(self, db, fake_image):
+        cid = record_correction(
+            db,
+            image_path=fake_image,
+            writer_id="prof-bio101-jdoe",
+            corrected_text="OD600 = 0.45",
+            original_vlm_text="OD60O = 0.45",
+            confidence=0.62,
+        )
+        assert cid > 0
+
+        assert db.execute("SELECT COUNT(*) FROM samples").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM ground_truths").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM corrections").fetchone()[0] == 1
+
+        sample = db.execute("SELECT * FROM samples").fetchone()
+        assert sample["student"] == "prof-bio101-jdoe"
+
+    def test_idempotent_identical_args(self, db, fake_image):
+        """Identical-args double-call: 1 sample + 1 GT + 2 corrections (history grows)."""
+        kwargs = dict(
+            image_path=fake_image,
+            writer_id="prof-bio101-jdoe",
+            corrected_text="OD600 = 0.45",
+            original_vlm_text="OD60O = 0.45",
+            confidence=0.62,
+        )
+        record_correction(db, **kwargs)
+        record_correction(db, **kwargs)
+
+        assert db.execute("SELECT COUNT(*) FROM samples").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM ground_truths").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM corrections").fetchone()[0] == 2
+
+    def test_different_correction_text_adds_new_gt(self, db, fake_image):
+        """Same image, two different corrected_text values → 1 sample, 2 GTs, 2 corrections."""
+        record_correction(
+            db, image_path=fake_image, writer_id="w1",
+            corrected_text="first read", original_vlm_text="orig", confidence=0.6,
+        )
+        record_correction(
+            db, image_path=fake_image, writer_id="w1",
+            corrected_text="revised read", original_vlm_text="orig", confidence=0.6,
+        )
+        assert db.execute("SELECT COUNT(*) FROM samples").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM ground_truths").fetchone()[0] == 2
+        assert db.execute("SELECT COUNT(*) FROM corrections").fetchone()[0] == 2
+
+    def test_per_writer_accumulation(self, db, tmp_path):
+        """Per spec criterion #5: same writer across 'sessions' adds to same student value."""
+        for i in range(3):
+            img = tmp_path / f"p{i}.png"
+            img.write_bytes(f"png-bytes-{i}".encode())
+            record_correction(
+                db, image_path=str(img), writer_id="prof-bio101-jdoe",
+                corrected_text=f"text {i}", original_vlm_text=f"orig {i}", confidence=0.5,
+            )
+        count = db.execute(
+            "SELECT COUNT(*) FROM samples WHERE student = ?", ("prof-bio101-jdoe",)
+        ).fetchone()[0]
+        assert count == 3
+
+    def test_correction_links_to_real_sample_and_gt(self, db, fake_image):
+        cid = record_correction(
+            db, image_path=fake_image, writer_id="w1",
+            corrected_text="real text", original_vlm_text="vlm text", confidence=0.8,
+            source="labgrader",
+        )
+        row = db.execute("SELECT * FROM corrections WHERE id = ?", (cid,)).fetchone()
+        assert row["original_text"] == "vlm text"
+        assert row["confidence"] == 0.8
+        assert row["source"] == "labgrader"
+
+        # FK integrity: linked sample and GT must exist
+        assert db.execute("SELECT 1 FROM samples WHERE id = ?", (row["sample_id"],)).fetchone()
+        assert db.execute("SELECT 1 FROM ground_truths WHERE id = ?", (row["ground_truth_id"],)).fetchone()

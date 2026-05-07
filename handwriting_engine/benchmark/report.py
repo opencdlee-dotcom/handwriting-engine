@@ -18,6 +18,18 @@ from handwriting_engine.benchmark.db import (
 )
 from handwriting_engine.benchmark.evaluate import estimate_cost
 from handwriting_engine.benchmark.models import StrategyResult
+from handwriting_engine.benchmark.stats import (
+    bootstrap_ci,
+    cohens_r,
+    wilcoxon_signed_rank,
+)
+
+
+# Minimum paired-sample count for the statistics layer to attach. Below this,
+# normal-approximation Wilcoxon is too rough and bootstrap CIs are dominated
+# by sampling noise — better to print nothing than to print a misleading
+# p-value. Aligns with Phase 8 success criterion #1.
+_STATS_MIN_PAIRED_N = 10
 
 
 def _aggregate_results(rows: list[dict]) -> list[StrategyResult]:
@@ -183,12 +195,49 @@ def _format_csv(results: list[StrategyResult]) -> str:
     return output.getvalue().strip()
 
 
+def _paired_cers(
+    rows_1: list[dict],
+    rows_2: list[dict],
+    provider: str,
+    strategy: str,
+) -> tuple[list[float], list[float]]:
+    """Pair per-sample CERs from two runs by sample_id, restricted to the
+    given (provider, strategy). Order is sample_id-sorted and identical
+    on both sides — that's what makes the test paired."""
+    by_sample_1 = {
+        r["sample_id"]: r["cer"]
+        for r in rows_1
+        if r.get("provider") == provider
+        and r.get("strategy") == strategy
+        and r.get("cer") is not None
+    }
+    by_sample_2 = {
+        r["sample_id"]: r["cer"]
+        for r in rows_2
+        if r.get("provider") == provider
+        and r.get("strategy") == strategy
+        and r.get("cer") is not None
+    }
+    shared = sorted(set(by_sample_1) & set(by_sample_2))
+    return ([by_sample_1[sid] for sid in shared],
+            [by_sample_2[sid] for sid in shared])
+
+
 def compare_runs(
     run_id_1: int,
     run_id_2: int,
     db_path: Path | str | None = None,
 ) -> str:
-    """Compare two benchmark runs side by side."""
+    """Compare two benchmark runs side by side.
+
+    For each (provider, strategy) pair shared between the runs, when the
+    paired sample count is >= 10 the output appends:
+    - paired Wilcoxon signed-rank p-value and z-score
+    - Cohen's r effect size
+    - 95% bootstrap CIs for each run's CER
+
+    Pairing is by sample_id — same image, different run.
+    """
     conn = get_connection(db_path)
     try:
         rows_1 = get_run_results(conn, run_id_1)
@@ -233,6 +282,26 @@ def compare_runs(
                 f"{provider:<20} {strategy:<10} {r1.mean_cer:>7.2%} {r2.mean_cer:>7.2%} "
                 f"{delta:>+7.2%} {status:>12}"
             )
+
+            paired_a, paired_b = _paired_cers(rows_1, rows_2, provider, strategy)
+            if len(paired_a) >= _STATS_MIN_PAIRED_N:
+                wilcox = wilcoxon_signed_rank(paired_a, paired_b)
+                r_effect = cohens_r(wilcox.z, wilcox.n)
+                lo_a, hi_a = bootstrap_ci(paired_a, seed=run_id_1)
+                lo_b, hi_b = bootstrap_ci(paired_b, seed=run_id_2)
+                lines.append(
+                    f"{'  stats:':<31} "
+                    f"n={wilcox.n} "
+                    f"W={wilcox.statistic:.1f} "
+                    f"z={wilcox.z:+.2f} "
+                    f"p={wilcox.p_value:.4f} "
+                    f"r={r_effect:.2f}"
+                )
+                lines.append(
+                    f"{'  CI95:':<31} "
+                    f"run#{run_id_1} [{lo_a:.2%}, {hi_a:.2%}]  "
+                    f"run#{run_id_2} [{lo_b:.2%}, {hi_b:.2%}]"
+                )
         elif r1 and not r2:
             cer_str = f"{r1.mean_cer:>7.2%}" if r1.mean_cer >= 0 else "    N/A"
             lines.append(f"{provider:<20} {strategy:<10} {cer_str} {'---':>8} {'---':>8} {'removed':>12}")
@@ -245,16 +314,156 @@ def compare_runs(
     return "\n".join(lines)
 
 
+# --- Phase 9 / RPT-02: configuration recommendation ---
+
+
+# Composite score weights. The contract from REQUIREMENTS.md is 70/15/15;
+# changing these is a product decision, not a code change.
+_RECOMMEND_W_CER = 0.70
+_RECOMMEND_W_COST = 0.15
+_RECOMMEND_W_STAB = 0.15
+
+
+def recommend_strategy(db_path: Path | str | None = None) -> str:
+    """Rank (provider, strategy) configurations by a composite score.
+
+    Score = 0.70 * (1 - cer_norm) + 0.15 * (1 - cost_norm) + 0.15 * stab_norm,
+    where each component is min-max normalized within the candidate set.
+    Lower CER and lower cost score higher; higher stability scores higher.
+
+    Stability is the inverse of CER stdev across runs of the same
+    (provider, strategy). When a candidate has only one run, it is given
+    the median stability score of the candidate set (neutral) and the
+    output flags it as `n=1`.
+
+    Returns a ranked human-readable table with the winner annotated.
+    """
+    conn = get_connection(db_path)
+    try:
+        runs = list_runs(conn)
+        if not runs:
+            return "No runs in database — nothing to recommend."
+
+        # Per-(provider, strategy) accumulator across all runs.
+        accum: dict[tuple[str, str], dict] = {}
+        for run in runs:
+            rows = get_run_results(conn, run.run_id)
+            for r in _aggregate_results(rows):
+                if r.mean_cer < 0:
+                    continue
+                key = (r.provider, r.strategy)
+                bucket = accum.setdefault(key, {
+                    "cers_per_run": [],
+                    "cost_per_sample_runs": [],
+                    "total_runs": 0,
+                })
+                bucket["cers_per_run"].append(r.mean_cer)
+                if r.sample_count > 0:
+                    bucket["cost_per_sample_runs"].append(
+                        r.estimated_cost_usd / r.sample_count
+                    )
+                bucket["total_runs"] += 1
+    finally:
+        conn.close()
+
+    if not accum:
+        return "No (provider, strategy) configurations with measured CER — nothing to recommend."
+
+    # Compute summary stats per candidate.
+    summaries: list[dict] = []
+    for (provider, strategy), bucket in accum.items():
+        cers = bucket["cers_per_run"]
+        costs = bucket["cost_per_sample_runs"]
+        n_runs = bucket["total_runs"]
+        mean_cer = sum(cers) / len(cers)
+        stdev_cer = statistics.stdev(cers) if len(cers) >= 2 else None
+        mean_cost = sum(costs) / len(costs) if costs else 0.0
+        summaries.append({
+            "provider": provider,
+            "strategy": strategy,
+            "n_runs": n_runs,
+            "mean_cer": mean_cer,
+            "stdev_cer": stdev_cer,
+            "mean_cost_per_sample": mean_cost,
+        })
+
+    # Normalize each component to [0, 1] within the candidate set.
+    cers = [s["mean_cer"] for s in summaries]
+    costs = [s["mean_cost_per_sample"] for s in summaries]
+    cer_min, cer_max = min(cers), max(cers)
+    cost_min, cost_max = min(costs), max(costs)
+
+    measured_stdevs = [s["stdev_cer"] for s in summaries if s["stdev_cer"] is not None]
+    median_stdev = statistics.median(measured_stdevs) if measured_stdevs else 0.0
+    stdevs_for_norm = [
+        s["stdev_cer"] if s["stdev_cer"] is not None else median_stdev
+        for s in summaries
+    ]
+    stdev_min, stdev_max = min(stdevs_for_norm), max(stdevs_for_norm)
+
+    def _norm(x: float, lo: float, hi: float) -> float:
+        if hi - lo < 1e-12:
+            return 0.5  # all candidates equal on this axis
+        return (x - lo) / (hi - lo)
+
+    for s, eff_stdev in zip(summaries, stdevs_for_norm):
+        cer_n = _norm(s["mean_cer"], cer_min, cer_max)
+        cost_n = _norm(s["mean_cost_per_sample"], cost_min, cost_max)
+        stab_n = 1.0 - _norm(eff_stdev, stdev_min, stdev_max)
+        s["score"] = (
+            _RECOMMEND_W_CER * (1.0 - cer_n)
+            + _RECOMMEND_W_COST * (1.0 - cost_n)
+            + _RECOMMEND_W_STAB * stab_n
+        )
+
+    summaries.sort(key=lambda s: s["score"], reverse=True)
+    winner = summaries[0]
+
+    lines = [
+        "Strategy + provider recommendation",
+        f"  weights: CER {_RECOMMEND_W_CER:.0%}  "
+        f"cost {_RECOMMEND_W_COST:.0%}  "
+        f"stability {_RECOMMEND_W_STAB:.0%}",
+        "",
+        f"  Winner: {winner['provider']} + {winner['strategy']}  "
+        f"(score {winner['score']:.3f})",
+        "",
+    ]
+    header = (
+        f"{'Rank':<4} {'Provider':<12} {'Strategy':<14} "
+        f"{'CER':>7} {'$/sample':>10} {'stdev':>9} {'n':>3} {'score':>7}"
+    )
+    lines.append(header)
+    lines.append("-" * len(header))
+
+    for rank, s in enumerate(summaries, start=1):
+        stdev_str = f"{s['stdev_cer']:.3f}" if s["stdev_cer"] is not None else "  n=1"
+        lines.append(
+            f"{rank:<4} {s['provider']:<12} {s['strategy']:<14} "
+            f"{s['mean_cer']:>6.2%} {s['mean_cost_per_sample']:>9.4f}$ "
+            f"{stdev_str:>9} {s['n_runs']:>3} {s['score']:>7.3f}"
+        )
+
+    return "\n".join(lines)
+
+
 def detect_regressions(
     run_id: int | None = None,
     threshold: float = 0.03,
     db_path: Path | str | None = None,
 ) -> list[dict]:
-    """Compare latest run against previous run. Returns list of regressions.
+    """Compare a run against the pinned baseline. Returns list of regressions.
+
+    Phase 9 / RPT-01: anchor is the run pinned via `benchmark set-baseline`.
+    Falls back to the previous run when no baseline is pinned, preserving
+    pre-Phase-9 behavior on a freshly-initialized DB. Excludes self-compare
+    when the current run IS the baseline.
 
     Default threshold is 3% — with small sample sizes (<30), differences
     below this are within the noise floor and not meaningful.
     """
+    from handwriting_engine.benchmark.db import get_baseline_run_id
+
     conn = get_connection(db_path)
     try:
         runs = list_runs(conn)
@@ -264,13 +473,21 @@ def detect_regressions(
 
         if run_id is None:
             current = runs[0]
-            previous = runs[1]
         else:
             current = next((r for r in runs if r.run_id == run_id), None)
-            idx = next((i for i, r in enumerate(runs) if r.run_id == run_id), None)
+        if not current:
+            return []
+
+        baseline_run_id = get_baseline_run_id(conn)
+        if baseline_run_id is not None and baseline_run_id != current.run_id:
+            previous = next((r for r in runs if r.run_id == baseline_run_id), None)
+        else:
+            # No pinned baseline (or current IS the baseline) — use the run
+            # immediately preceding `current`, matching pre-Phase-9 behavior.
+            idx = next((i for i, r in enumerate(runs) if r.run_id == current.run_id), None)
             previous = runs[idx + 1] if idx is not None and idx + 1 < len(runs) else None
 
-        if not current or not previous:
+        if not previous:
             return []
 
         rows_curr = get_run_results(conn, current.run_id)
@@ -526,4 +743,70 @@ def confidence_calibration(
             lines.append(f"  {r['provider']}/{r['strategy']}: confidence={r['confidence']:.2f}, CER={r['cer']:.2%}")
 
     lines.append("")
+    return "\n".join(lines)
+
+
+def generate_per_writer_report(
+    run_id: int | None = None,
+    db_path: Path | str | None = None,
+) -> str:
+    """Per-writer CER breakdown for a benchmark run (IAM-03).
+
+    Groups eval_metrics by samples.student so the developer can tell whether a
+    strategy's CER gain is consistent across writers or driven by a few easy
+    ones. Requires samples to have been ingested with student tags (e.g. via
+    `benchmark ingest-iam`, which sets student='iam-writer-XXX').
+    """
+    conn = get_connection(db_path)
+    try:
+        if run_id is None:
+            run_id = get_latest_run_id(conn)
+        if run_id is None:
+            return "No runs found in database."
+
+        rows = conn.execute(
+            """SELECT s.student         AS student,
+                      AVG(em.cer)       AS mean_cer,
+                      MIN(em.cer)       AS min_cer,
+                      MAX(em.cer)       AS max_cer,
+                      COUNT(*)          AS n_samples
+               FROM provider_outputs po
+               JOIN eval_metrics em ON em.provider_output_id = po.id
+               JOIN samples s      ON s.id = po.sample_id
+               WHERE po.run_id = ?
+                 AND s.student IS NOT NULL
+                 AND s.student != ''
+               GROUP BY s.student
+               ORDER BY mean_cer DESC""",
+            (run_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        return (
+            f"Per-Writer CER (Run #{run_id})\n\n"
+            "No writer data found for this run.\n"
+            "Tip: ingest IAM samples with `benchmark ingest-iam` first — "
+            "only IAM samples carry per-writer tags."
+        )
+
+    header = f"{'Writer':<25} {'Mean CER':>9} {'Min CER':>9} {'Max CER':>9} {'N':>4}"
+    separator = "-" * len(header)
+    lines = [
+        f"Per-Writer CER (Run #{run_id})",
+        "",
+        header,
+        separator,
+    ]
+    for r in rows:
+        lines.append(
+            f"{r['student']:<25} "
+            f"{r['mean_cer']:>8.2%} "
+            f"{r['min_cer']:>8.2%} "
+            f"{r['max_cer']:>8.2%} "
+            f"{r['n_samples']:>4}"
+        )
+    lines.append(separator)
+    lines.append(f"  {len(rows)} writer(s) shown")
     return "\n".join(lines)

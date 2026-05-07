@@ -4,17 +4,114 @@ Persistent writer profile store for cross-session handwriting calibration.
 Saves writer-specific disambiguation observations (how they form 7s, 4s, a vs o,
 etc.) to ~/.handwriting-engine/writer-profiles/{writer_id}.json and injects
 them as a calibration block into transcription prompts.
+
+Also serves as the home for S2 per-writer few-shot exemplar selection
+(``select_exemplars``), since exemplars are conceptually a richer flavor of
+the same writer-calibration mechanism.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import sqlite3
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 _PROFILES_DIR = Path.home() / ".handwriting-engine" / "writer-profiles"
+
+
+@dataclass(frozen=True)
+class Exemplar:
+    """One (sample, ground-truth) pair to inject as a few-shot exemplar."""
+
+    sample_id: int
+    image_path: str
+    ground_truth: str
+
+
+def select_exemplars(
+    writer_id: str,
+    *,
+    k: int = 3,
+    exclude_sample_id: Optional[int] = None,
+    db_path: Optional[str | Path] = None,
+    conn: Optional[sqlite3.Connection] = None,
+) -> list[Exemplar]:
+    """Return up to ``k`` deterministic exemplars for ``writer_id``.
+
+    Strategy v0 per S2-SPEC § Design:
+    1. Pull every (sample, ground_truth) pair where ``samples.student =
+       writer_id`` (latest GT per sample wins on ties).
+    2. Order by ``quality_assessments.score DESC`` when available (joined
+       LEFT so writers without quality data still produce results), then by
+       ``samples.id ASC`` for determinism.
+    3. Slice ``min(k, len)`` off the top.
+
+    Returns ``[]`` for empty writers, ``k <= 0``, or when no eligible
+    sample/GT pair exists. Existence of the image on disk is *not* checked
+    here — callers that need that guarantee filter post hoc.
+
+    Either ``conn`` or ``db_path`` may be supplied. With neither, defaults
+    to ``DEFAULT_DB_PATH`` from ``benchmark.db``.
+    """
+    if not writer_id or k <= 0:
+        return []
+
+    owns_conn = conn is None
+    if owns_conn:
+        from handwriting_engine.benchmark.db import get_connection
+
+        conn = get_connection(db_path)
+    try:
+        # Latest GT per sample: ROW_NUMBER would be ideal but SQLite versions
+        # bundled with older Pythons lack window functions reliably; use a
+        # correlated subquery instead.
+        params: list = [writer_id]
+        exclude_sql = ""
+        if exclude_sample_id is not None:
+            exclude_sql = "AND s.id != ?"
+            params.append(exclude_sample_id)
+
+        # quality_assessments may not have a row for every sample — LEFT JOIN
+        # so missing scores fall to the bottom (NULL sorted last via COALESCE).
+        sql = f"""
+            SELECT
+                s.id          AS sample_id,
+                s.image_path  AS image_path,
+                gt.text       AS ground_truth
+            FROM samples AS s
+            JOIN ground_truths AS gt
+                ON gt.sample_id = s.id
+                AND gt.id = (
+                    SELECT MAX(id) FROM ground_truths WHERE sample_id = s.id
+                )
+            LEFT JOIN quality_assessments AS qa
+                ON qa.sample_id = s.id
+            WHERE s.student = ?
+              {exclude_sql}
+            ORDER BY
+                COALESCE(qa.contrast_score, -1) DESC,
+                s.id ASC
+            LIMIT ?
+        """
+        params.append(k)
+        rows = conn.execute(sql, params).fetchall()
+    finally:
+        if owns_conn:
+            conn.close()
+
+    return [
+        Exemplar(
+            sample_id=row["sample_id"],
+            image_path=row["image_path"],
+            ground_truth=row["ground_truth"],
+        )
+        for row in rows
+    ]
 
 
 class WriterProfileStore:

@@ -82,37 +82,110 @@ def enhance(path, strategy, output):
     click.echo(f"Enhanced: {result}")
 
 
+_ALT_MARKER_RE = __import__("re").compile(r"\[\?alt:\s*([^\]]+)\]")
+
+
+def _extract_alt_markers(text: str) -> list[dict]:
+    """Pull `[?alt: a/b]` markers out of consensus text into a structured list.
+
+    Skill-side `--strict` mode uses these to prompt the user once per ambiguity.
+    """
+    markers = []
+    for match in _ALT_MARKER_RE.finditer(text):
+        alts = [a.strip() for a in match.group(1).split("/") if a.strip()]
+        markers.append({"raw": match.group(0), "alternatives": alts})
+    return markers
+
+
 @cli.command()
 @click.argument("path", type=click.Path(exists=True))
 @click.option("--provider", "-p", default="claude", type=click.Choice(["claude", "openai", "gemini", "consensus"]))
-@click.option("--domain", "-d", default="biology")
+@click.option("--domain", "-d", default="general",
+              help="Domain hint (general, biology, ...). Default 'general' so skill callers pass --domain=bio explicitly.")
 @click.option("--prompt", default="", help="Custom reading prompt")
-def read(path, provider, domain, prompt):
+@click.option("--writer", default=None,
+              help="Writer ID for WriterProfileStore lookup (per-writer few-shot/calibration)")
+@click.option("--format", "fmt", default="txt",
+              type=click.Choice(["txt", "md", "json"]),
+              help="Output shape. 'json' emits a structured payload with extracted alt-markers — used by the handwriting-reader skill.")
+def read(path, provider, domain, prompt, writer, fmt):
     """Read handwritten text from image or PDF."""
-    import os
-
     if path.lower().endswith(".pdf"):
         import tempfile
         from handwriting_engine.pdf import convert_pdf
         tmpdir = tempfile.mkdtemp(prefix="hwe_read_")
         _temp_dirs.append(tmpdir)
         pages = convert_pdf(path, tmpdir)
-        image_paths = [p["path"] for p in pages]
+        image_paths = [(p.get("page_number", i + 1), p["path"]) for i, p in enumerate(pages)]
     else:
-        image_paths = [path]
+        image_paths = [(1, path)]
 
-    for img in image_paths:
+    page_payloads = []
+    for page_no, img in image_paths:
         if provider == "consensus":
-            from handwriting_engine.vision import read_with_consensus
-            result = read_with_consensus(img, prompt=prompt, domain=domain)
-            click.echo(f"--- Confidence: {result.confidence:.2f} ({result.strategy_used}) ---")
-            click.echo(result.text)
-            if result.disagreements:
-                click.echo(f"\nDisagreements: {result.disagreements}")
+            from handwriting_engine import vision as _vision
+            result = _vision.read_with_consensus(img, prompt=prompt, domain=domain, writer_id=writer)
+            page_payloads.append({
+                "page_number": page_no,
+                "image_path": img,
+                "text": result.text,
+                "provider": "consensus",
+                "confidence": result.confidence,
+                "confidence_level": result.confidence_level,
+                "strategy_used": result.strategy_used,
+                "disagreements": list(result.disagreements),
+                "alt_markers": _extract_alt_markers(result.text),
+                "provider_results": dict(result.provider_results),
+                "tokens_used": dict(result.tokens_used),
+            })
         else:
-            from handwriting_engine.vision import read_page
-            text = read_page(img, prompt=prompt, domain=domain, provider=provider)
-            click.echo(text)
+            from handwriting_engine import vision as _vision
+            text = _vision.read_page(img, prompt=prompt, domain=domain, provider=provider)
+            page_payloads.append({
+                "page_number": page_no,
+                "image_path": img,
+                "text": text,
+                "provider": provider,
+                "confidence": None,
+                "confidence_level": None,
+                "strategy_used": None,
+                "disagreements": [],
+                "alt_markers": _extract_alt_markers(text),
+                "provider_results": {provider: text},
+                "tokens_used": {},
+            })
+
+    if fmt == "json":
+        click.echo(json.dumps({
+            "path": path,
+            "domain": domain,
+            "writer": writer,
+            "pages": page_payloads,
+        }, indent=2))
+        return
+
+    if fmt == "md":
+        for p in page_payloads:
+            header = f"## Page {p['page_number']}"
+            if p["confidence"] is not None:
+                header += f" — confidence {p['confidence']:.2f} ({p['confidence_level']})"
+            click.echo(header)
+            click.echo("")
+            click.echo(p["text"])
+            click.echo("")
+            if p["disagreements"]:
+                click.echo(f"_Disagreements: {p['disagreements']}_\n")
+        return
+
+    # Default: txt — preserve legacy echo behavior
+    for p in page_payloads:
+        if p["provider"] == "consensus":
+            click.echo(f"--- Confidence: {p['confidence']:.2f} ({p['strategy_used']}) ---")
+            click.echo(p["text"])
+            if p["disagreements"]:
+                click.echo(f"\nDisagreements: {p['disagreements']}")
+        else:
+            click.echo(p["text"])
 
 
 @cli.command()
@@ -242,6 +315,53 @@ def benchmark_ingest_iam(ascii_dir, lines_dir, partition_file, all_partitions, d
     except FileNotFoundError as exc:
         click.echo(f"ERROR: {exc}", err=True)
         raise SystemExit(1)
+
+
+@benchmark.command("ingest-lab")
+@click.argument("directory", type=click.Path(exists=True, file_okay=False))
+@click.option("--student", "-s", default="lab", help="Student / author tag for these images")
+@click.option("--with-suggestion", is_flag=True, default=False,
+              help="Pre-fill each prompt with a single VLM read (costs ~$/image).")
+@click.option("--vlm-provider", default="gemini", show_default=True,
+              help="Provider for VLM suggestion (when --with-suggestion).")
+@click.option("--db-path", default=None, hidden=True)
+def benchmark_ingest_lab(directory, student, with_suggestion, vlm_provider, db_path):
+    """Guided annotation: capture ground-truth transcriptions for lab notebook images.
+
+    For each image in DIRECTORY, opens $EDITOR (or prompts inline) with an
+    optional VLM-suggested transcription. Save to record as ground truth;
+    leave empty / cancel to skip an image. Re-running on the same directory
+    skips images that already have ground truth — safe to resume.
+    """
+    from handwriting_engine.benchmark.ingest import ingest_lab
+
+    def _prompt(image_path: str, suggestion: str) -> str | None:
+        click.echo(f"\n--- {image_path} ---")
+        if suggestion:
+            click.echo(f"VLM suggestion: {suggestion}")
+        # click.edit returns None if EDITOR exits without saving (skip);
+        # otherwise it returns the buffer with trailing whitespace.
+        edited = click.edit(suggestion or "")
+        if edited is None:
+            return None
+        return edited.strip()
+
+    counts = ingest_lab(
+        directory,
+        student=student,
+        prompt_fn=_prompt,
+        db_path=db_path,
+        use_vlm_suggestion=with_suggestion,
+        vlm_provider=vlm_provider,
+    )
+    click.echo(
+        "\nLab ingest complete: "
+        f"{counts['annotated']} annotated, "
+        f"{counts['newly_added']} new samples, "
+        f"{counts['skipped_existing_gt']} already had ground truth, "
+        f"{counts['skipped_user']} skipped, "
+        f"{counts['errors']} errors."
+    )
 
 
 @benchmark.command("transcribe")
@@ -416,13 +536,90 @@ def benchmark_run_cmd(label, providers, strategies, domain, feed_lessons, smoke,
         click.echo(f"\nFed {count} lessons back to the lessons system.")
 
 
+@benchmark.command("sweep")
+@click.option("--provider", "-p", default="gemini",
+              help="Provider used for all 5 strategies (default: gemini)")
+@click.option("--yes", "-y", is_flag=True,
+              help="Bypass cost confirmation")
+@click.option("--db-path", default=None, hidden=True)
+def benchmark_sweep(provider, yes, db_path):
+    """Run all 5 strategies against the IAM test set, one run_id per strategy.
+
+    Strategies: baseline, self_correct, line_level, prompt_adapted, zoomed_verify.
+    Requires IAM samples in the DB — run `benchmark ingest-iam` first.
+    Prints projected cost before any API call.
+    """
+    from handwriting_engine.benchmark.evaluate import (
+        run_sweep, SWEEP_STRATEGIES, estimate_cost,
+    )
+    from handwriting_engine.benchmark.db import get_connection as _get_conn
+
+    # Count IAM samples with ground truth
+    conn = _get_conn(db_path)
+    try:
+        row = conn.execute(
+            "SELECT COUNT(DISTINCT s.id) AS n FROM samples s "
+            "JOIN ground_truths gt ON gt.sample_id = s.id "
+            "WHERE s.category = 'iam'"
+        ).fetchone()
+        n_samples = row["n"] if row else 0
+    finally:
+        conn.close()
+
+    # Cost projection: ~2000 input + ~200 output tokens per sample per strategy
+    est_per_strategy = estimate_cost(2000 * n_samples, 200 * n_samples, provider)
+    est_total = est_per_strategy * len(SWEEP_STRATEGIES)
+
+    click.echo(
+        f"\nSweep projection: {len(SWEEP_STRATEGIES)} strategies "
+        f"x {n_samples} IAM samples (provider={provider})"
+    )
+    click.echo(
+        f"  Estimated cost: ~${est_per_strategy:.4f}/strategy "
+        f"x {len(SWEEP_STRATEGIES)} = ~${est_total:.4f} total"
+    )
+    click.echo(
+        f"  Strategies: {', '.join(s['name'] for s in SWEEP_STRATEGIES)}\n"
+    )
+
+    if n_samples == 0:
+        click.echo(
+            "WARNING: No IAM samples with ground truth in DB. "
+            "Run `benchmark ingest-iam` first.",
+            err=True,
+        )
+
+    if not yes:
+        click.confirm(
+            f"Proceed with sweep (~${est_total:.4f} projected)?",
+            abort=True,
+        )
+
+    try:
+        run_ids = run_sweep(provider=provider, db_path=db_path, yes=yes)
+    except Exception as exc:
+        click.echo(f"ERROR during sweep: {exc}", err=True)
+        sys.exit(1)
+
+    click.echo("\nSweep complete:")
+    for name, run_id in run_ids.items():
+        click.echo(f"  {name:20s}: run_id={run_id}")
+
+
 @benchmark.command("report")
 @click.option("--run-id", "-r", default=None, type=int, help="Specific run (default: latest)")
 @click.option("--format", "fmt", default="table", type=click.Choice(["table", "json", "csv"]))
-def benchmark_report_cmd(run_id, fmt):
+@click.option("--per-writer", is_flag=True, default=False,
+              help="Show per-writer CER breakdown (requires IAM samples with student tags)")
+@click.option("--db-path", default=None, hidden=True)
+def benchmark_report_cmd(run_id, fmt, per_writer, db_path):
     """Show accuracy comparison table for a benchmark run."""
-    from handwriting_engine.benchmark.report import generate_report
+    if per_writer:
+        from handwriting_engine.benchmark.report import generate_per_writer_report
+        click.echo(generate_per_writer_report(run_id=run_id, db_path=db_path))
+        return
 
+    from handwriting_engine.benchmark.report import generate_report
     click.echo(generate_report(run_id, fmt=fmt))
 
 
@@ -437,6 +634,45 @@ def benchmark_compare_cmd(run_id_1, run_id_2):
     from handwriting_engine.benchmark.report import compare_runs
 
     click.echo(compare_runs(run_id_1, run_id_2))
+
+
+@benchmark.command("recommend")
+@click.option("--db-path", default=None, type=click.Path(),
+              help="Override database path (default: ~/.handwriting-engine/benchmark.db).")
+def benchmark_recommend_cmd(db_path):
+    """Recommend the best (provider, strategy) configuration.
+
+    Composite score: 70% CER, 15% cost, 15% stability across runs.
+    Each component is min-max normalized within the candidate set.
+    Single-run candidates get the median stability score (neutral).
+    """
+    from handwriting_engine.benchmark.report import recommend_strategy
+
+    click.echo(recommend_strategy(db_path=db_path))
+
+
+@benchmark.command("set-baseline")
+@click.argument("run_id", type=int)
+@click.option("--db-path", default=None, type=click.Path(),
+              help="Override database path (default: ~/.handwriting-engine/benchmark.db).")
+def benchmark_set_baseline_cmd(run_id, db_path):
+    """Pin RUN_ID as the regression-detection anchor.
+
+    `detect_regressions` and `benchmark report` then compare future runs
+    against this pinned run rather than the immediately-preceding run.
+    Exactly one run is the baseline at any time; this command atomically
+    clears the prior pin and sets the new one.
+    """
+    from handwriting_engine.benchmark.db import get_connection, set_baseline
+
+    conn = get_connection(db_path)
+    try:
+        set_baseline(conn, run_id)
+    except ValueError as e:
+        raise click.ClickException(str(e))
+    finally:
+        conn.close()
+    click.echo(f"Baseline pinned: run #{run_id}")
 
 
 @benchmark.command("drill-down")
@@ -556,6 +792,73 @@ def benchmark_bootstrap_gt_cmd(agreement, confidence):
         agreement_threshold=agreement, confidence_threshold=confidence,
     )
     click.echo(f"Auto-generated {count} ground truths from consensus")
+
+
+# =====================================================================
+# Trained post-correction (optional — requires [trained-correction] extras)
+# =====================================================================
+
+@cli.group(name="trained-correction")
+def trained_correction_group():
+    """Train and evaluate the optional trained post-correction model.
+
+    Requires: pip install handwriting-engine[trained-correction]
+    """
+
+
+@trained_correction_group.command(name="train")
+@click.option("--output-dir", "-o", required=True, type=click.Path(),
+              help="Directory for the trained checkpoint + manifest")
+@click.option("--num-pairs", default=50000, type=int, help="Synthetic training pairs to generate")
+@click.option("--num-epochs", default=2, type=int)
+@click.option("--batch-size", default=8, type=int)
+@click.option("--learning-rate", default=3e-4, type=float)
+@click.option("--max-input-length", default=256, type=int)
+@click.option("--max-target-length", default=256, type=int)
+@click.option("--device", default="auto", type=click.Choice(["auto", "cpu", "mps", "cuda"]))
+@click.option("--seed", default=42, type=int)
+@click.option("--quick", is_flag=True, help="Tiny smoke run")
+@click.option("--no-system-wordlist", is_flag=True)
+@click.option("--model-name", default="google/flan-t5-small", show_default=True)
+@click.option("--from-benchmark-db", is_flag=True,
+              help="Mix real (VLM_output, ground_truth) pairs from the benchmark DB")
+@click.option("--benchmark-db-path", default=None, type=click.Path(),
+              help="Override the default benchmark.db path")
+@click.option("--benchmark-providers", default=None,
+              help="Comma-separated provider filter (e.g. 'gemini,claude')")
+@click.option("--real-data-weight", default=3, type=int,
+              help="Replication factor for real pairs (default 3)")
+@click.option("--continue-from", default=None, type=click.Path(),
+              help="Continue fine-tuning from an existing checkpoint")
+def trained_correction_train(**kwargs):
+    """Fine-tune the synthetic-data corrector. Long-running."""
+    from handwriting_engine.trained_correction.train import main as train_main
+    argv: list[str] = []
+    for k, v in kwargs.items():
+        flag = "--" + k.replace("_", "-")
+        if isinstance(v, bool):
+            if v:
+                argv.append(flag)
+        elif v is not None:
+            argv.extend([flag, str(v)])
+    sys.exit(train_main(argv))
+
+
+@trained_correction_group.command(name="eval")
+@click.option("--n-pairs", default=1000, type=int)
+@click.option("--seed", default=1234, type=int)
+@click.option("--domain", default="biology")
+@click.option("--skip-trained", is_flag=True, help="Heuristic-only baseline (no model load)")
+@click.option("--output", default=None, type=click.Path(), help="Optional JSON output path")
+def trained_correction_eval(n_pairs, seed, domain, skip_trained, output):
+    """A/B evaluate post-correction pipelines on synthetic pairs."""
+    from handwriting_engine.trained_correction.eval import main as eval_main
+    argv = ["--n-pairs", str(n_pairs), "--seed", str(seed), "--domain", domain]
+    if skip_trained:
+        argv.append("--skip-trained")
+    if output:
+        argv.extend(["--output", output])
+    sys.exit(eval_main(argv))
 
 
 if __name__ == "__main__":
