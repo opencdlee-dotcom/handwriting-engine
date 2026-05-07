@@ -99,3 +99,4 @@ class RunSummary:
     iam_partition: str | None = None
     norm_flags: str | None = None
     vocab_hints_off: int = 0
+    is_baseline: int = 0
