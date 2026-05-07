@@ -76,7 +76,7 @@ class TrainedCorrector:
                 import torch  # noqa: F401
                 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
             except ImportError as e:
-                raise RuntimeError(
+                raise ImportError(
                     "Trained corrector requires optional deps. Install with: "
                     "pip install handwriting-engine[trained-correction]"
                 ) from e
