@@ -25,7 +25,7 @@ Full details: `.planning/milestones/v2.0-ROADMAP.md`
 - [x] **Phase 6: Measurement Foundation** — Reproducible baseline + variance floor + cost guardrails (completed 2026-04-11)
 - [x] **Phase 7: IAM Data Ingestion + Sweep Infrastructure** — Full IAM benchmark pipeline (completed 2026-05-06)
 - [ ] **Phase 8: Statistics Layer** — Statistical defensibility for all comparisons (implementation shipped 2026-05-06; criterion verification gated on user IAM download + first sweep run; see `.planning/NEXT-STEPS.md`)
-- [ ] **Phase 9: Final Sweep, Recommendation, and Baseline Lock** — Best config identified, regression anchor committed
+- [ ] **Phase 9: Final Sweep, Recommendation, and Baseline Lock** — Best config identified, regression anchor committed (implementation shipped 2026-05-06; verification of "best config recommendation" gated on user IAM download + first multi-strategy sweep)
 
 ## Phase Details
 
@@ -82,7 +82,12 @@ Plans:
   1. Developer runs `benchmark set-baseline RUN_ID` to pin any run as the regression anchor; `detect_regressions()` then compares future runs against that pinned run (not the penultimate run), and the schema tracks the `is_baseline` flag durably across sessions.
   2. `benchmark recommend` outputs a single ranked recommendation with a composite score (70% CER / 15% cost / 15% stability) and the winning strategy+provider combination is unambiguous.
   3. Developer can run `benchmark ingest-lab` against real student lab notebook images and store ground-truth transcriptions via a guided annotation workflow, producing a production-distribution test set that is separate from IAM.
-**Plans**: TBD
+**Plans**: 3 plans
+
+Plans:
+- [x] 09-01-PLAN.md — Schema v6 is_baseline + set_baseline/get_baseline + detect_regressions retarget + CLI (RPT-01) (completed 2026-05-06)
+- [x] 09-02-PLAN.md — recommend_strategy() composite 70/15/15 score + CLI (RPT-02) (completed 2026-05-06; verification gated on multi-strategy IAM sweep)
+- [x] 09-03-PLAN.md — ingest_lab() guided annotation + CLI (RPT-03) (completed 2026-05-06)
 
 ## Progress
 
