@@ -88,10 +88,11 @@ Now the (vlm_output, ground_truth) pairs from the sweep can fine-tune the FLAN-T
 # Continue from the v1 synthetic checkpoint (don't start from scratch — preserves
 # the easy-error fixes the synthetic data already taught it):
 python3 -m handwriting_engine.trained_correction.train \
-    --from-benchmark-db ~/.handwriting-engine/benchmark.db \
+    --from-benchmark-db \
+    --benchmark-db-path ~/.handwriting-engine/benchmark.db \
     --continue-from ~/.handwriting-engine/models/trained-corrector-v1 \
     --output-dir ~/.handwriting-engine/models/trained-corrector-v2 \
-    --epochs 3
+    --num-epochs 3
 
 # A/B eval: v2 vs v1 vs heuristic-only
 python3 -m handwriting_engine.cli trained-correction eval --n-pairs 200 --seed 9999
