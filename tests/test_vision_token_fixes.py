@@ -167,3 +167,78 @@ def test_vocab_hints_cache_survives_corrupt_file(tmp_path, monkeypatch):
     out = vision._extract_vocabulary_hints(img_b64, "image/jpeg")
     assert out == ["alpha", "beta", "gamma"]
     fake_provider.read_image.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Task 4: dual-polarity short-circuit on confident first read
+# ---------------------------------------------------------------------------
+
+
+def test_dual_polarity_skips_inverted_when_confident(tmp_path):
+    """When the first (normal) read has high confidence and zero uncertainty
+    markers, the inverted read must NOT be invoked.
+    """
+    from PIL import Image
+
+    from handwriting_engine import vision
+
+    img_path = tmp_path / "page.jpg"
+    Image.new("RGB", (32, 32), "white").save(img_path)
+
+    fake_provider = MagicMock()
+    fake_provider.read_image = MagicMock(
+        return_value=(
+            "The mitochondria is the powerhouse of the cell. "
+            "ATP synthesis happens via oxidative phosphorylation. "
+            "Cellular respiration produces energy for cellular processes."
+        )
+    )
+
+    out = vision._dual_polarity_read(
+        str(img_path),
+        b64_data="aWdub3JlZA==",
+        media_type="image/jpeg",
+        provider_obj=fake_provider,
+        prompt="read it",
+        system_prompt="",
+        max_tokens=512,
+    )
+
+    # Provider was called exactly once (the normal read), inverted skipped
+    assert fake_provider.read_image.call_count == 1
+    assert "mitochondria" in out
+
+
+def test_dual_polarity_runs_inverted_when_first_read_low_confidence(tmp_path):
+    """If the first read has uncertainty markers, the inverted pass MUST
+    still run — short-circuit must not regress the existing path.
+    """
+    from PIL import Image
+
+    from handwriting_engine import vision
+
+    img_path = tmp_path / "page.jpg"
+    Image.new("RGB", (32, 32), "white").save(img_path)
+
+    # First read has [?] markers → must NOT short-circuit
+    responses = iter([
+        "the [?] is the [?] of the cell [illegible: 5 chars]",
+        "the mitochondria is the powerhouse of the cell",
+    ])
+    fake_provider = MagicMock()
+    fake_provider.read_image = MagicMock(side_effect=lambda *a, **k: next(responses))
+
+    out = vision._dual_polarity_read(
+        str(img_path),
+        b64_data="aWdub3JlZA==",
+        media_type="image/jpeg",
+        provider_obj=fake_provider,
+        prompt="read it",
+        system_prompt="",
+        max_tokens=512,
+    )
+
+    # Provider was called twice (normal + inverted)
+    assert fake_provider.read_image.call_count == 2
+    # And inverted (cleaner) won
+    assert "mitochondria" in out

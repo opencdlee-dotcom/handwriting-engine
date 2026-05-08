@@ -324,6 +324,24 @@ def _dual_polarity_read(
     # Normal read
     normal_text = provider_obj.read_image(b64_data, media_type, prompt, system_prompt, max_tokens)
 
+    # Short-circuit: if the first read is already clean and confident, the
+    # inverted pass is pure cost. Faint-ink mode triggered this path because
+    # quality assessment said the image MIGHT need inversion — but the model
+    # may have read it fine anyway (e.g. only part of the page was faint).
+    marker_re = re.compile(r"\[\?\]|\?\?\?|\[illegible[^\]]*\]", re.IGNORECASE)
+    try:
+        from handwriting_engine.consensus import _single_text_confidence
+        normal_markers_pre = len(marker_re.findall(normal_text))
+        normal_conf = _single_text_confidence(normal_text)
+        if normal_conf >= 0.65 and normal_markers_pre == 0:
+            logger.debug(
+                "Dual-polarity short-circuit: first read confident (%.2f, 0 markers)",
+                normal_conf,
+            )
+            return normal_text
+    except Exception as e:
+        logger.debug("Dual-polarity confidence check failed (%s); running inverted", e)
+
     # Create inverted image
     try:
         img = Image.open(image_path)
@@ -354,7 +372,6 @@ def _dual_polarity_read(
         return normal_text
 
     # Pick the cleaner result (fewer uncertainty markers)
-    marker_re = re.compile(r"\[\?\]|\?\?\?|\[illegible[^\]]*\]", re.IGNORECASE)
     normal_markers = len(marker_re.findall(normal_text))
     inverted_markers = len(marker_re.findall(inverted_text))
 
