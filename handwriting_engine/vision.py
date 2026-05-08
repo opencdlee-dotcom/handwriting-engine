@@ -217,15 +217,59 @@ def _postprocess_output(text: str, domain: str | None = None) -> str:
     return result.strip()
 
 
+# Persistent vocab-priming cache: {sha256(image_b64) -> [hint, ...]} as JSON.
+# Reused across processes so re-grading the same image doesn't pay the
+# extra cloud call. Override target via monkeypatch in tests.
+_VOCAB_CACHE_DIR = Path.home() / ".handwriting-engine" / "vocab-cache"
+
+
+def _vocab_cache_path(image_b64: str) -> Path:
+    digest = hashlib.sha256(image_b64.encode("utf-8")).hexdigest()
+    return _VOCAB_CACHE_DIR / f"{digest}.json"
+
+
+def _vocab_cache_load(image_b64: str) -> list[str] | None:
+    """Return cached hints for this image or None on miss/error."""
+    import json
+    path = _vocab_cache_path(image_b64)
+    try:
+        if not path.exists():
+            return None
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list) and all(isinstance(x, str) for x in data):
+            return data
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    return None
+
+
+def _vocab_cache_save(image_b64: str, hints: list[str]) -> None:
+    """Persist hints; swallow errors (cache is best-effort)."""
+    import json
+    try:
+        _VOCAB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        path = _vocab_cache_path(image_b64)
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(hints, f)
+    except OSError as e:
+        logger.debug("vocab cache write failed: %s", e)
+
+
 def _extract_vocabulary_hints(image_b64: str, media_type: str) -> list[str]:
     """Cheap pre-scan to extract clearly legible words for vocabulary priming.
 
     Uses Gemini Flash (cheapest provider) with minimal tokens to identify
     domain terms that are clearly visible. These are then injected as
     vocabulary_hints for the full read, helping the model resolve ambiguous
-    characters in context.
+    characters in context. Results are persisted by image hash so a second
+    read of the same image skips the extra cloud call.
     """
     from handwriting_engine._constants import VOCAB_PRIMING_MAX_TOKENS
+
+    cached = _vocab_cache_load(image_b64)
+    if cached is not None:
+        return cached
 
     try:
         avail = available_providers()
@@ -250,7 +294,9 @@ def _extract_vocabulary_hints(image_b64: str, media_type: str) -> list[str]:
             if low not in seen and len(w) > 2:
                 seen.add(low)
                 unique.append(w)
-        return unique[:50]
+        hints = unique[:50]
+        _vocab_cache_save(image_b64, hints)
+        return hints
     except Exception as e:
         logger.warning("Vocabulary priming failed: %s", e)
         return []

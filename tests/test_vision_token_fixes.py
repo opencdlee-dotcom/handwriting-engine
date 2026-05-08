@@ -102,3 +102,68 @@ def test_gemini_context_cache_consensus_provider_list():
         )
 
     fake_provider.enable_context_cache.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Task 3: persistent vocab-priming cache (hash → JSON)
+# ---------------------------------------------------------------------------
+
+
+def test_vocab_hints_cached_to_disk_and_reused(tmp_path, monkeypatch):
+    """Second call with the same image b64 must NOT invoke the provider."""
+    from handwriting_engine import vision
+
+    # Redirect cache dir to tmp_path so we don't pollute ~/.handwriting-engine
+    monkeypatch.setattr(vision, "_VOCAB_CACHE_DIR", tmp_path / "vocab-cache")
+
+    call_counter = {"n": 0}
+
+    def fake_read_image(*args, **kwargs):
+        call_counter["n"] += 1
+        return "alpha, beta, gamma"
+
+    fake_provider = MagicMock()
+    fake_provider.read_image = MagicMock(side_effect=fake_read_image)
+
+    monkeypatch.setattr(vision, "available_providers", lambda: ["gemini"])
+    monkeypatch.setattr(vision, "get_provider", lambda name: fake_provider)
+
+    img_b64 = "ZmFrZS1pbWFnZS1ieXRlcw=="  # "fake-image-bytes" base64
+
+    first = vision._extract_vocabulary_hints(img_b64, "image/jpeg")
+    assert first == ["alpha", "beta", "gamma"]
+    assert call_counter["n"] == 1
+
+    # Second call: should hit disk cache
+    second = vision._extract_vocabulary_hints(img_b64, "image/jpeg")
+    assert second == ["alpha", "beta", "gamma"]
+    assert call_counter["n"] == 1, "provider must not be called on cache hit"
+
+    # Different image: should miss and call provider again
+    third = vision._extract_vocabulary_hints("b3RoZXItaW1hZ2U=", "image/jpeg")
+    assert third == ["alpha", "beta", "gamma"]
+    assert call_counter["n"] == 2
+
+
+def test_vocab_hints_cache_survives_corrupt_file(tmp_path, monkeypatch):
+    """A malformed cache JSON should fall through to a fresh provider call."""
+    import hashlib
+
+    from handwriting_engine import vision
+
+    cache_dir = tmp_path / "vocab-cache"
+    cache_dir.mkdir(parents=True)
+    monkeypatch.setattr(vision, "_VOCAB_CACHE_DIR", cache_dir)
+
+    img_b64 = "Y29ycnVwdC1jYWNoZQ=="
+    digest = hashlib.sha256(img_b64.encode("utf-8")).hexdigest()
+    (cache_dir / f"{digest}.json").write_text("{not json")
+
+    fake_provider = MagicMock()
+    fake_provider.read_image = MagicMock(return_value="alpha, beta, gamma")
+    monkeypatch.setattr(vision, "available_providers", lambda: ["gemini"])
+    monkeypatch.setattr(vision, "get_provider", lambda name: fake_provider)
+
+    out = vision._extract_vocabulary_hints(img_b64, "image/jpeg")
+    assert out == ["alpha", "beta", "gamma"]
+    fake_provider.read_image.assert_called_once()
