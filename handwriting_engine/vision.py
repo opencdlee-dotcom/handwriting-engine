@@ -572,13 +572,26 @@ def read_page(
         marker_count = len(re.findall(r"\[\?\]|\?\?\?|\[illegible[^\]]*\]", raw, re.IGNORECASE))
 
         if confidence < ZOOM_VERIFY_CONFIDENCE_LOW:
-            # Very low confidence — full retry with enhancement comparison
-            logger.info("Low confidence (%.2f), retrying with enhancement comparison", confidence)
-            retry = read_with_enhancement_comparison(
-                image_path, domain=domain, provider=provider, enhance_strategy="proven",
-            )
-            if _single_text_confidence(retry) > confidence:
-                raw = _postprocess_output(retry, domain=domain) if postprocess else retry
+            # Very low confidence — try cheap zoomed verify FIRST. It re-reads
+            # only the uncertain strips (1-3 cropped sections) instead of the
+            # whole page twice. If zoom doesn't lift confidence, fall back to
+            # the more expensive enhancement comparison (2 full-page reads).
+            logger.info("Low confidence (%.2f), trying zoomed verification first", confidence)
+            zoomed = _zoomed_verify(image_path, raw, provider, system_prompt, max_tokens)
+            if postprocess:
+                zoomed = _postprocess_output(zoomed, domain=domain)
+            zoom_confidence = _single_text_confidence(zoomed)
+            if zoom_confidence > confidence:
+                raw = zoomed
+                confidence = zoom_confidence
+            else:
+                logger.info("Zoom did not lift confidence (%.2f), retrying with enhancement comparison",
+                             zoom_confidence)
+                retry = read_with_enhancement_comparison(
+                    image_path, domain=domain, provider=provider, enhance_strategy="proven",
+                )
+                if _single_text_confidence(retry) > confidence:
+                    raw = _postprocess_output(retry, domain=domain) if postprocess else retry
         elif confidence < ZOOM_VERIFY_CONFIDENCE_HIGH and marker_count >= ZOOM_VERIFY_MIN_MARKERS:
             # Moderate confidence with uncertainty markers — zoomed crop verification
             logger.info("Moderate confidence (%.2f) with %d markers, trying zoomed verification",
