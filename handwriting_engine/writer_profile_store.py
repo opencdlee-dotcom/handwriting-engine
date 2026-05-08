@@ -114,6 +114,53 @@ def select_exemplars(
     ]
 
 
+def get_ground_truth_pairs_for_writer(
+    writer_id: str,
+    *,
+    db_path: Optional[str | Path] = None,
+    conn: Optional[sqlite3.Connection] = None,
+) -> list[tuple[str, str]]:
+    """Return every (image_path, ground_truth_text) pair for ``writer_id``.
+
+    Used by the Stage 4 fine-tune-writer CLI: pulls the corpus that
+    ``TrOCRProvider.fine_tune_for_writer`` consumes. Latest GT per sample
+    wins on ties (same convention as ``select_exemplars``).
+
+    Either ``conn`` or ``db_path`` may be supplied; with neither, defaults
+    to the benchmark DB at ``DEFAULT_DB_PATH``.
+    """
+    if not writer_id:
+        return []
+
+    owns_conn = conn is None
+    if owns_conn:
+        from handwriting_engine.benchmark.db import get_connection
+
+        conn = get_connection(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT
+                s.image_path AS image_path,
+                gt.text      AS ground_truth
+            FROM samples AS s
+            JOIN ground_truths AS gt
+                ON gt.sample_id = s.id
+                AND gt.id = (
+                    SELECT MAX(id) FROM ground_truths WHERE sample_id = s.id
+                )
+            WHERE s.student = ?
+            ORDER BY s.id ASC
+            """,
+            (writer_id,),
+        ).fetchall()
+    finally:
+        if owns_conn:
+            conn.close()
+
+    return [(row["image_path"], row["ground_truth"]) for row in rows]
+
+
 class WriterProfileStore:
     """Load, save, and inject writer-specific handwriting profiles."""
 

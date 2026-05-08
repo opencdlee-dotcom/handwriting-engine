@@ -10,6 +10,7 @@ import shutil
 import click
 import json
 import sys
+from pathlib import Path
 
 # Track temp dirs for cleanup
 _temp_dirs: list[str] = []
@@ -324,27 +325,54 @@ def benchmark_ingest_iam(ascii_dir, lines_dir, partition_file, all_partitions, d
               help="Pre-fill each prompt with a single VLM read (costs ~$/image).")
 @click.option("--vlm-provider", default="gemini", show_default=True,
               help="Provider for VLM suggestion (when --with-suggestion).")
+@click.option("--gt-suffix", default=None,
+              help="Non-interactive mode: read ground truth from a sibling file "
+                   "with this suffix (e.g. '.txt' pairs page1.png with page1.txt). "
+                   "Skips $EDITOR entirely — required for scripted workflows.")
 @click.option("--db-path", default=None, hidden=True)
-def benchmark_ingest_lab(directory, student, with_suggestion, vlm_provider, db_path):
+def benchmark_ingest_lab(directory, student, with_suggestion, vlm_provider, gt_suffix, db_path):
     """Guided annotation: capture ground-truth transcriptions for lab notebook images.
 
     For each image in DIRECTORY, opens $EDITOR (or prompts inline) with an
     optional VLM-suggested transcription. Save to record as ground truth;
     leave empty / cancel to skip an image. Re-running on the same directory
     skips images that already have ground truth — safe to resume.
+
+    Pass --gt-suffix .txt to skip the editor and pull ground truth from a
+    sibling file (page1.png + page1.txt). Empty or missing sibling files are
+    treated as user-skip — same disposition as cancelling the editor.
     """
     from handwriting_engine.benchmark.ingest import ingest_lab
 
-    def _prompt(image_path: str, suggestion: str) -> str | None:
-        click.echo(f"\n--- {image_path} ---")
-        if suggestion:
-            click.echo(f"VLM suggestion: {suggestion}")
-        # click.edit returns None if EDITOR exits without saving (skip);
-        # otherwise it returns the buffer with trailing whitespace.
-        edited = click.edit(suggestion or "")
-        if edited is None:
-            return None
-        return edited.strip()
+    if gt_suffix is not None:
+        # Normalize suffix so callers can pass "txt" or ".txt" interchangeably.
+        suffix = gt_suffix if gt_suffix.startswith(".") else f".{gt_suffix}"
+
+        def _prompt(image_path: str, _suggestion: str) -> str | None:
+            sibling = Path(image_path).with_suffix(suffix)
+            if not sibling.exists():
+                click.echo(f"  skip: no sibling {sibling.name} for {Path(image_path).name}")
+                return None
+            try:
+                text = sibling.read_text(encoding="utf-8").strip()
+            except Exception as exc:
+                click.echo(f"  skip: could not read {sibling.name}: {exc}", err=True)
+                return None
+            if not text:
+                click.echo(f"  skip: {sibling.name} is empty")
+                return None
+            return text
+    else:
+        def _prompt(image_path: str, suggestion: str) -> str | None:
+            click.echo(f"\n--- {image_path} ---")
+            if suggestion:
+                click.echo(f"VLM suggestion: {suggestion}")
+            # click.edit returns None if EDITOR exits without saving (skip);
+            # otherwise it returns the buffer with trailing whitespace.
+            edited = click.edit(suggestion or "")
+            if edited is None:
+                return None
+            return edited.strip()
 
     counts = ingest_lab(
         directory,
@@ -538,54 +566,119 @@ def benchmark_run_cmd(label, providers, strategies, domain, feed_lessons, smoke,
 
 @benchmark.command("sweep")
 @click.option("--provider", "-p", default="gemini",
-              help="Provider used for all 5 strategies (default: gemini)")
+              help="Provider used for all cloud strategies (default: gemini). "
+                   "Local strategies (e.g. trocr_local) ignore this flag.")
+@click.option("--category", default="iam", show_default=True,
+              help="Sample category to sweep (e.g. 'iam', 'lab'). "
+                   "Pass '' (empty string) to sweep every category in the DB.")
 @click.option("--yes", "-y", is_flag=True,
               help="Bypass cost confirmation")
 @click.option("--db-path", default=None, hidden=True)
-def benchmark_sweep(provider, yes, db_path):
-    """Run all 5 strategies against the IAM test set, one run_id per strategy.
+def benchmark_sweep(provider, category, yes, db_path):
+    """Run every sweep strategy against samples in a category, one run_id per strategy.
 
-    Strategies: baseline, self_correct, line_level, prompt_adapted, zoomed_verify.
-    Requires IAM samples in the DB — run `benchmark ingest-iam` first.
-    Prints projected cost before any API call.
+    Cloud strategies (cost API tokens, run on --provider):
+      baseline, self_correct, line_level, prompt_adapted, zoomed_verify
+    Local strategies (zero API tokens, run on the named provider):
+      trocr_local (requires `pip install -e '.[trained-correction]'`)
+
+    Defaults to category='iam' for backward compat with the IAM rollout.
+    Pass --category lab to sweep ingested lab notebook pages, or --category ''
+    to sweep every category in the DB. Requires matching samples in the DB
+    with ground truth — run `benchmark ingest-iam` or `benchmark ingest-lab`
+    first. Prints projected cost before any API call. Strategies whose
+    provider isn't installed are skipped with a warning rather than failing
+    the sweep.
     """
     from handwriting_engine.benchmark.evaluate import (
         run_sweep, SWEEP_STRATEGIES, estimate_cost,
     )
     from handwriting_engine.benchmark.db import get_connection as _get_conn
 
-    # Count IAM samples with ground truth
+    # Empty string -> sweep all categories (None signals run_sweep to skip the WHERE filter).
+    category_filter: str | None = category if category else None
+
+    # Count samples with ground truth (filtered by category when set)
     conn = _get_conn(db_path)
     try:
-        row = conn.execute(
-            "SELECT COUNT(DISTINCT s.id) AS n FROM samples s "
-            "JOIN ground_truths gt ON gt.sample_id = s.id "
-            "WHERE s.category = 'iam'"
-        ).fetchone()
+        if category_filter is None:
+            row = conn.execute(
+                "SELECT COUNT(DISTINCT s.id) AS n FROM samples s "
+                "JOIN ground_truths gt ON gt.sample_id = s.id"
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT COUNT(DISTINCT s.id) AS n FROM samples s "
+                "JOIN ground_truths gt ON gt.sample_id = s.id "
+                "WHERE s.category = ?",
+                (category_filter,),
+            ).fetchone()
         n_samples = row["n"] if row else 0
     finally:
         conn.close()
 
-    # Cost projection: ~2000 input + ~200 output tokens per sample per strategy
-    est_per_strategy = estimate_cost(2000 * n_samples, 200 * n_samples, provider)
-    est_total = est_per_strategy * len(SWEEP_STRATEGIES)
+    # Cost projection: ~2000 input + ~200 output tokens per sample per strategy.
+    # Three cost classes:
+    #   cloud  — full API call per sample, charged at --provider's rate
+    #   local  — zero API tokens (e.g. trocr_local)
+    #   mixed  — local-first with cloud fallback; assume worst-case 100%
+    #            escalation rate so the user never gets a surprise bill.
+    #            cost_provider can pin a specific cloud model (claude vs gemini).
+    def _cost_class(s):
+        # Backward-compat: strategies without an explicit cost_class fall back
+        # to the legacy rule "providers field present == local".
+        if "cost_class" in s:
+            return s["cost_class"]
+        return "local" if s.get("providers") else "cloud"
 
+    cloud_strategies = [s for s in SWEEP_STRATEGIES if _cost_class(s) == "cloud"]
+    local_strategies = [s for s in SWEEP_STRATEGIES if _cost_class(s) == "local"]
+    mixed_strategies = [s for s in SWEEP_STRATEGIES if _cost_class(s) == "mixed"]
+
+    est_per_cloud = estimate_cost(2000 * n_samples, 200 * n_samples, provider)
+    est_total = est_per_cloud * len(cloud_strategies)
+    for s in mixed_strategies:
+        # Worst case: every sample escalates. Charged at the strategy's pinned
+        # provider when set (some local_first variants use claude, not gemini).
+        mixed_provider = s.get("cost_provider") or provider
+        est_total += estimate_cost(2000 * n_samples, 200 * n_samples, mixed_provider)
+
+    samples_label = f"category={category}" if category_filter else "all categories"
     click.echo(
         f"\nSweep projection: {len(SWEEP_STRATEGIES)} strategies "
-        f"x {n_samples} IAM samples (provider={provider})"
+        f"x {n_samples} samples ({samples_label}, provider={provider})"
     )
     click.echo(
-        f"  Estimated cost: ~${est_per_strategy:.4f}/strategy "
-        f"x {len(SWEEP_STRATEGIES)} = ~${est_total:.4f} total"
+        f"  Estimated cost (cloud): ~${est_per_cloud:.4f}/strategy "
+        f"x {len(cloud_strategies)} = ~${est_per_cloud * len(cloud_strategies):.4f}"
     )
+    if mixed_strategies:
+        mixed_added = est_total - est_per_cloud * len(cloud_strategies)
+        click.echo(
+            f"  Estimated cost (mixed, local-first + cloud fallback at "
+            f"worst-case 100% escalation): ~${mixed_added:.4f} for "
+            f"{', '.join(s['name'] for s in mixed_strategies)}"
+        )
+    if local_strategies:
+        click.echo(
+            f"  Local (zero token cost): "
+            f"{', '.join(s['name'] for s in local_strategies)}"
+        )
     click.echo(
         f"  Strategies: {', '.join(s['name'] for s in SWEEP_STRATEGIES)}\n"
     )
 
     if n_samples == 0:
+        if category_filter == "iam":
+            hint = "Run `benchmark ingest-iam` first."
+        elif category_filter == "lab":
+            hint = "Run `benchmark ingest-lab` first."
+        elif category_filter:
+            hint = f"No samples ingested with category='{category_filter}'."
+        else:
+            hint = "No samples with ground truth in DB. Run an ingest command first."
         click.echo(
-            "WARNING: No IAM samples with ground truth in DB. "
-            "Run `benchmark ingest-iam` first.",
+            f"WARNING: No samples with ground truth match {samples_label}. {hint}",
             err=True,
         )
 
@@ -596,7 +689,9 @@ def benchmark_sweep(provider, yes, db_path):
         )
 
     try:
-        run_ids = run_sweep(provider=provider, db_path=db_path, yes=yes)
+        run_ids = run_sweep(
+            provider=provider, db_path=db_path, yes=yes, category=category_filter,
+        )
     except Exception as exc:
         click.echo(f"ERROR during sweep: {exc}", err=True)
         sys.exit(1)
@@ -928,6 +1023,48 @@ def trained_correction_train(**kwargs):
     sys.exit(train_main(argv))
 
 
+@trained_correction_group.command(name="retrain-from-trocr")
+@click.option("--db-path", default=None, type=click.Path(),
+              help="Override benchmark DB path "
+                   "(default: ~/.handwriting-engine/benchmark.db)")
+@click.option("--v1-path", default=None, type=click.Path(),
+              help="Synthetic v1 checkpoint to continue from "
+                   "(default: ~/.handwriting-engine/models/trained-corrector-v1)")
+@click.option("--v3-path", default=None, type=click.Path(),
+              help="Output directory for the retrained v3 checkpoint "
+                   "(default: ~/.handwriting-engine/models/trained-corrector-v3)")
+@click.option("--num-epochs", default=3, type=int, show_default=True)
+@click.option("--pairs-min", default=50, type=int, show_default=True,
+              help="Minimum TrOCR pair count required to proceed")
+@click.option("--no-eval", is_flag=True,
+              help="Skip the post-training v1-vs-v3 CER comparison")
+@click.option("--eval-n-pairs", default=200, type=int, show_default=True)
+def trained_correction_retrain_from_trocr(
+    db_path, v1_path, v3_path, num_epochs, pairs_min, no_eval, eval_n_pairs,
+):
+    """Retrain v1 -> v3 on real (TrOCR_output, ground_truth) pairs.
+
+    Stage 3 of the local-first OCR rollout. Reads pairs from the benchmark
+    DB (provider=trocr + has ground truth), continues fine-tuning from the
+    v1 synthetic checkpoint, and writes a v3 checkpoint. Exits 1 with a
+    remediation message if the DB doesn't have enough pairs yet — run
+    `bench-my-pages.py` or `benchmark sweep` first to populate.
+    """
+    from handwriting_engine.trained_correction.retrain_from_trocr import (
+        retrain_from_trocr,
+    )
+    rc = retrain_from_trocr(
+        db_path=db_path,
+        v1_path=v1_path,
+        v3_path=v3_path,
+        num_epochs=num_epochs,
+        pairs_min=pairs_min,
+        run_eval=not no_eval,
+        eval_n_pairs=eval_n_pairs,
+    )
+    sys.exit(rc)
+
+
 @trained_correction_group.command(name="eval")
 @click.option("--n-pairs", default=1000, type=int)
 @click.option("--seed", default=1234, type=int)
@@ -943,6 +1080,88 @@ def trained_correction_eval(n_pairs, seed, domain, skip_trained, output):
     if output:
         argv.extend(["--output", output])
     sys.exit(eval_main(argv))
+
+
+# =====================================================================
+# Stage 4 — per-writer TrOCR fine-tune (local-first rollout)
+# =====================================================================
+
+
+@cli.command("fine-tune-writer")
+@click.argument("writer_id")
+@click.option("--epochs", default=3, type=click.IntRange(1, 50), show_default=True,
+              help="Number of fine-tuning epochs (default 3 per arXiv 2305.02593).")
+@click.option("--min-pairs", default=5, type=click.IntRange(1, 1000), show_default=True,
+              help="Minimum (image, ground-truth) pairs required. Aborts otherwise.")
+@click.option("--lr", default=5e-5, type=float, show_default=True,
+              help="AdamW learning rate.")
+@click.option("--db-path", default=None, hidden=True,
+              help="Override the benchmark DB path (testing only).")
+def fine_tune_writer_cmd(writer_id, epochs, min_pairs, lr, db_path):
+    """Fine-tune TrOCR on every ground-truthed sample for WRITER_ID.
+
+    Pulls (image, ground_truth) pairs where samples.student = WRITER_ID, then
+    calls TrOCRProvider.fine_tune_for_writer. Saves a writer-specific
+    checkpoint to ~/.handwriting-engine/writer-models/<WRITER_ID>/, which the
+    next read of that writer auto-loads.
+
+    Per arXiv 2305.02593, 5 lines per writer is "very effective" for
+    single-writer HTR — that's the default --min-pairs floor.
+    """
+    from handwriting_engine.writer_profile_store import get_ground_truth_pairs_for_writer
+
+    pairs = get_ground_truth_pairs_for_writer(writer_id, db_path=db_path)
+    if len(pairs) < min_pairs:
+        click.echo(
+            f"ERROR: writer {writer_id!r} has {len(pairs)} ground-truthed pair"
+            f"{'s' if len(pairs) != 1 else ''} in the benchmark DB; need at "
+            f"least {min_pairs}. Capture more lines via "
+            f"`benchmark ingest-lab` or `benchmark transcribe` first.",
+            err=True,
+        )
+        sys.exit(1)
+
+    # Lazy-import: keep base64/torch off the import path until fine-tune runs.
+    import base64
+
+    from handwriting_engine.providers import get_provider
+
+    image_b64s: list[str] = []
+    transcriptions: list[str] = []
+    for image_path, gt_text in pairs:
+        try:
+            with open(image_path, "rb") as f:
+                image_b64s.append(base64.standard_b64encode(f.read()).decode("utf-8"))
+            transcriptions.append(gt_text)
+        except (OSError, IOError) as exc:
+            click.echo(f"  skipping unreadable image {image_path}: {exc}", err=True)
+
+    if len(image_b64s) < min_pairs:
+        click.echo(
+            f"ERROR: only {len(image_b64s)} pairs had readable images on disk "
+            f"(need {min_pairs}). Re-ingest or fix paths and retry.",
+            err=True,
+        )
+        sys.exit(1)
+
+    click.echo(
+        f"Fine-tuning TrOCR for writer {writer_id!r} on {len(image_b64s)} pairs "
+        f"(epochs={epochs}, lr={lr})..."
+    )
+    # Always start from the BASE checkpoint, never an existing writer model —
+    # iterating on top of yesterday's checkpoint snowballs drift.
+    provider = get_provider("trocr")
+    save_dir = provider.fine_tune_for_writer(
+        writer_id=writer_id,
+        line_images_b64=image_b64s,
+        transcriptions=transcriptions,
+        epochs=epochs,
+        lr=lr,
+    )
+    click.echo(f"Checkpoint saved: {save_dir}")
+    click.echo(
+        f"Next reads with `--writer {writer_id}` will auto-load this checkpoint."
+    )
 
 
 if __name__ == "__main__":

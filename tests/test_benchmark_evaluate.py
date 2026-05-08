@@ -585,6 +585,166 @@ class TestSweep:
             assert name in result.output
 
 
+class TestSweepCategoryFilter:
+    """Sweep --category support — fixes IAM-hardcoded skip of lab data."""
+
+    @patch("handwriting_engine.benchmark.evaluate._available_providers")
+    @patch("handwriting_engine.benchmark.evaluate._read_single")
+    def test_run_sweep_lab_selects_only_lab_samples(
+        self, mock_read, mock_providers, db_path, tmp_path,
+    ):
+        """category='lab' must restrict the sweep to lab-tagged samples."""
+        from PIL import Image
+
+        conn = get_connection(db_path)
+        img_iam = tmp_path / "iam.png"
+        img_lab = tmp_path / "lab.png"
+        Image.new("RGB", (200, 200), color=(128, 128, 128)).save(img_iam)
+        Image.new("RGB", (200, 200), color=(64, 64, 64)).save(img_lab)
+        sid_iam = insert_sample(conn, str(img_iam), "hashIam",
+                                student="iam-writer", category="iam")
+        sid_lab = insert_sample(conn, str(img_lab), "hashLab",
+                                student="lab-student", category="lab")
+        insert_ground_truth(conn, sid_iam, "the mitochondria is the powerhouse of the cell")
+        insert_ground_truth(conn, sid_lab, "the cell underwent mitosis today")
+        conn.close()
+
+        mock_providers.return_value = ["gemini"]
+        # Echo back the right text per image so CER stays 0 either way.
+        def fake_read(path, *args, **kwargs):
+            if "lab.png" in path:
+                text = "the cell underwent mitosis today"
+            else:
+                text = "the mitochondria is the powerhouse of the cell"
+            return {
+                "text": text, "confidence": 0.7, "latency_ms": 500,
+                "input_tokens": 100, "output_tokens": 50, "error": None,
+            }
+        mock_read.side_effect = fake_read
+
+        run_ids = run_sweep(
+            provider="gemini", db_path=db_path, yes=True, category="lab",
+        )
+        assert run_ids, "expected at least one strategy run"
+
+        # Every output across every strategy must be from the lab sample only.
+        conn = get_connection(db_path)
+        rows = conn.execute(
+            "SELECT DISTINCT sample_id FROM provider_outputs WHERE run_id IN (%s)"
+            % ",".join("?" * len(run_ids)),
+            tuple(run_ids.values()),
+        ).fetchall()
+        conn.close()
+        sample_ids_seen = {r["sample_id"] for r in rows}
+        assert sample_ids_seen == {sid_lab}, (
+            f"sweep included non-lab samples: saw {sample_ids_seen}, expected {{{sid_lab}}}"
+        )
+
+    @patch("handwriting_engine.benchmark.evaluate._available_providers")
+    @patch("handwriting_engine.benchmark.evaluate._read_single")
+    def test_run_sweep_no_category_arg_includes_iam(
+        self, mock_read, mock_providers, seeded_db,
+    ):
+        """Backward compat: no-arg run_sweep must still process IAM samples
+        (existing IAM workflows must not regress when category defaults to None=all)."""
+        # Tag the seeded sample as IAM, matching the prior hardcoded filter.
+        conn = get_connection(seeded_db)
+        try:
+            conn.execute("UPDATE samples SET category='iam' WHERE id=1")
+            conn.commit()
+        finally:
+            conn.close()
+
+        mock_providers.return_value = ["gemini"]
+        mock_read.return_value = {
+            "text": "the mitochondria is the powerhouse of the cell",
+            "confidence": 0.7, "latency_ms": 500,
+            "input_tokens": 100, "output_tokens": 50, "error": None,
+        }
+
+        # No category argument — should still pick up the IAM sample.
+        run_ids = run_sweep(provider="gemini", db_path=seeded_db, yes=True)
+        assert run_ids, "no-arg sweep produced zero runs (IAM regression)"
+
+        # And each cloud strategy must have evaluated the IAM sample.
+        conn = get_connection(seeded_db)
+        rows = conn.execute(
+            "SELECT DISTINCT sample_id FROM provider_outputs WHERE run_id IN (%s)"
+            % ",".join("?" * len(run_ids)),
+            tuple(run_ids.values()),
+        ).fetchall()
+        conn.close()
+        assert {r["sample_id"] for r in rows} == {1}
+
+
+class TestIngestLabGtSuffix:
+    """`benchmark ingest-lab --gt-suffix .txt` runs without prompting."""
+
+    def test_cli_gt_suffix_skips_editor(self, tmp_path):
+        """Paired *.png + *.txt directory ingests with no $EDITOR prompt."""
+        from PIL import Image
+        from handwriting_engine.cli import cli
+
+        img_dir = tmp_path / "lab"
+        img_dir.mkdir()
+        # Two paired files.
+        for i, gt in enumerate(["page zero text", "page one text"]):
+            img = img_dir / f"page_{i}.png"
+            Image.new("RGB", (64, 64), (10 + i, 20 + i, 30 + i)).save(img)
+            (img_dir / f"page_{i}.txt").write_text(gt, encoding="utf-8")
+
+        db = tmp_path / "lab.db"
+        runner = CliRunner()
+        # Patch click.edit so a regression that re-introduces the editor
+        # path will fail loudly (returning None marks every page as skipped).
+        with patch("click.edit", return_value=None) as mock_edit:
+            result = runner.invoke(cli, [
+                "benchmark", "ingest-lab", str(img_dir),
+                "--gt-suffix", ".txt",
+                "--db-path", str(db),
+            ])
+        assert result.exit_code == 0, result.output
+        assert mock_edit.call_count == 0, (
+            "ingest-lab --gt-suffix should not call click.edit"
+        )
+        assert "2 annotated" in result.output, result.output
+
+        # Ground truth ended up in the DB, sourced from the .txt files.
+        conn = get_connection(db)
+        rows = conn.execute(
+            "SELECT text FROM ground_truths ORDER BY text"
+        ).fetchall()
+        conn.close()
+        assert [r["text"] for r in rows] == ["page one text", "page zero text"]
+
+    def test_cli_gt_suffix_missing_sibling_skips(self, tmp_path):
+        """Image without a matching .txt is treated as user-skip."""
+        from PIL import Image
+        from handwriting_engine.cli import cli
+
+        img_dir = tmp_path / "lab"
+        img_dir.mkdir()
+        img_a = img_dir / "page_a.png"
+        img_b = img_dir / "page_b.png"
+        Image.new("RGB", (64, 64), (10, 20, 30)).save(img_a)
+        Image.new("RGB", (64, 64), (40, 50, 60)).save(img_b)
+        (img_dir / "page_a.txt").write_text("only A has GT", encoding="utf-8")
+        # page_b.txt intentionally missing.
+
+        db = tmp_path / "lab.db"
+        runner = CliRunner()
+        with patch("click.edit", return_value=None) as mock_edit:
+            result = runner.invoke(cli, [
+                "benchmark", "ingest-lab", str(img_dir),
+                "--gt-suffix", ".txt",
+                "--db-path", str(db),
+            ])
+        assert result.exit_code == 0, result.output
+        assert mock_edit.call_count == 0
+        assert "1 annotated" in result.output, result.output
+        assert "1 skipped" in result.output, result.output
+
+
 class TestPerWriterReport:
     """Per-writer report (IAM-03) — turned GREEN in Phase 07-04."""
 
