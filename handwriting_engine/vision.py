@@ -6,6 +6,7 @@ Delegates to providers/ for actual API calls.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 from pathlib import Path
@@ -19,6 +20,126 @@ from handwriting_engine.providers import get_provider, available_providers
 from handwriting_engine.providers.base import ConsensusResult
 
 logger = logging.getLogger(__name__)
+
+
+def _build_system_prompt(
+    *,
+    domain: str,
+    content_type: str,
+    writer_profile: dict | None,
+    faint_protocol: str,
+    inject_lessons: bool,
+    writer_id: str | None,
+    vocabulary_hints: list[str] | None,
+    inject_strategies: bool,
+) -> tuple[str, str]:
+    """Assemble the full system prompt and a stable cache key.
+
+    Returns (system_prompt_text, cache_key). The cache key is a sha256 hex
+    digest of the inputs that determine the prompt content — usable as a
+    dedup key for provider-side context caching.
+    """
+    from handwriting_engine.handwriting import get_reading_strategies
+
+    parts: list[str] = []
+
+    if inject_strategies:
+        strategies = get_reading_strategies(
+            domain=domain,
+            content_type=content_type,
+            writer_profile=writer_profile,
+        )
+        if strategies:
+            parts.append(strategies)
+
+    if faint_protocol:
+        parts.append(faint_protocol)
+
+    if inject_lessons:
+        from handwriting_engine.lessons import build_lessons_prompt
+        lessons = build_lessons_prompt(category=domain)
+        if lessons:
+            parts.append(lessons)
+
+    if writer_id:
+        from handwriting_engine.lessons import load_writer_calibration
+        writer_cal = load_writer_calibration(writer_id)
+        if writer_cal:
+            parts.append(writer_cal)
+
+    if vocabulary_hints:
+        hint_text = "Expected vocabulary includes: " + ", ".join(vocabulary_hints[:50])
+        parts.append(hint_text)
+
+    system_prompt = "\n\n".join(parts)
+
+    # Stable cache key over the inputs that determine the assembled prompt
+    key_material = "".join([
+        f"d={domain or ''}",
+        f"c={content_type or ''}",
+        f"wp={'1' if writer_profile else '0'}",
+        f"fp={'1' if faint_protocol else '0'}",
+        f"il={'1' if inject_lessons else '0'}",
+        f"wid={writer_id or ''}",
+        f"vh={'|'.join((vocabulary_hints or [])[:50])}",
+        f"is={'1' if inject_strategies else '0'}",
+        # Hashing the assembled text guards against drift in the upstream
+        # builders (e.g. lessons store changes) — same inputs but different
+        # content should yield different cache keys.
+        f"body={system_prompt}",
+    ])
+    cache_key = hashlib.sha256(key_material.encode("utf-8")).hexdigest()
+
+    return system_prompt, cache_key
+
+
+# Module-level dedup set: tracks which Gemini context-cache keys have already
+# been registered with the gemini provider in this process.
+_gemini_cache_keys: set[str] = set()
+
+
+def _maybe_enable_gemini_cache(system_prompt: str, cache_key: str, providers_used) -> None:
+    """Enable Gemini context cache once per unique cache_key per process.
+
+    `providers_used` is either a single provider name (str) or an iterable of
+    provider names (for consensus). Caching is only attempted when "gemini"
+    is involved and the prompt is long enough to clear the minimum-token
+    threshold (Flash: 1,024 tokens; we approximate with a char budget so we
+    don't pay token-counting calls).
+    """
+    if not system_prompt:
+        return
+    if isinstance(providers_used, str):
+        if providers_used != "gemini":
+            return
+    else:
+        if "gemini" not in (providers_used or []):
+            return
+
+    if cache_key in _gemini_cache_keys:
+        return
+
+    # Rough char-based gate: ~4 chars/token. Flash minimum is 1,024 tokens,
+    # so require >= 4,096 chars before attempting to cache. Below this the
+    # provider would reject the cache create anyway and we'd just log.
+    if len(system_prompt) < 4096:
+        return
+
+    try:
+        gp = get_provider("gemini")
+    except Exception as e:
+        logger.debug("Gemini provider unavailable for context caching: %s", e)
+        return
+
+    enable = getattr(gp, "enable_context_cache", None)
+    if not callable(enable):
+        return
+
+    try:
+        enable(system_prompt)
+        _gemini_cache_keys.add(cache_key)
+    except Exception as e:
+        logger.debug("Gemini context cache enable failed: %s", e)
 
 # ---------------------------------------------------------------------------
 # Post-processing — strip common LLM artifacts from transcriptions
@@ -231,7 +352,6 @@ def read_page(
                        for content-type-specific reading strategies.
     """
     from handwriting_engine.optimize import validate_and_prepare_image
-    from handwriting_engine.handwriting import get_reading_strategies
 
     # Classify handwriting style for content-type-aware routing
     detected_content_type = "default"
@@ -296,40 +416,31 @@ def read_page(
         from handwriting_engine.writer_profile_store import WriterProfileStore
         writer_profile_dict = WriterProfileStore().load(writer_id)
 
-    if inject_strategies:
-        strategies = get_reading_strategies(
-            domain=domain,
-            content_type=detected_content_type,
-            writer_profile=writer_profile_dict,
-        )
-        system_prompt = strategies + ("\n\n" + system_prompt if system_prompt else "")
-
-    # Inject faint content protocol when image has faint ink
-    if faint_protocol:
-        system_prompt = (system_prompt + "\n\n" + faint_protocol) if system_prompt else faint_protocol
-
-    # Inject learned lessons from past corrections
-    if inject_lessons:
-        from handwriting_engine.lessons import build_lessons_prompt
-        lessons = build_lessons_prompt(category=domain)
-        if lessons:
-            system_prompt = system_prompt + "\n\n" + lessons if system_prompt else lessons
-
-    # Inject writer-specific calibration from lessons store (supplements WriterProfileStore)
-    if writer_id:
-        from handwriting_engine.lessons import load_writer_calibration
-        writer_cal = load_writer_calibration(writer_id)
-        if writer_cal:
-            system_prompt = (system_prompt + "\n\n" + writer_cal) if system_prompt else writer_cal
-
-    # Auto-extract vocabulary hints via cheap pre-scan when vocab_priming is enabled
+    # Auto-extract vocabulary hints via cheap pre-scan when vocab_priming is enabled.
+    # Done before assembling the system prompt so hints are folded in as part of
+    # the cached/hashed payload.
     if vocab_priming and not vocabulary_hints:
         vocabulary_hints = _extract_vocabulary_hints(b64_data, media_type)
 
-    # Inject vocabulary hints (research sweet spot: 20-50 terms)
-    if vocabulary_hints:
-        hint_text = "Expected vocabulary includes: " + ", ".join(vocabulary_hints[:50])
-        system_prompt = (system_prompt + "\n\n" + hint_text) if system_prompt else hint_text
+    # Assemble system prompt via shared helper so call sites stay aligned and
+    # we get a stable cache key for provider-side context caching.
+    assembled, cache_key = _build_system_prompt(
+        domain=domain,
+        content_type=detected_content_type,
+        writer_profile=writer_profile_dict,
+        faint_protocol=faint_protocol,
+        inject_lessons=inject_lessons,
+        writer_id=writer_id,
+        vocabulary_hints=vocabulary_hints,
+        inject_strategies=inject_strategies,
+    )
+    if assembled and system_prompt:
+        system_prompt = assembled + "\n\n" + system_prompt
+    else:
+        system_prompt = assembled or system_prompt
+
+    # Wire Gemini context cache (idempotent per cache_key, gated by length)
+    _maybe_enable_gemini_cache(system_prompt, cache_key, provider)
 
     # Adapt prompts for provider-specific optimization
     from handwriting_engine.prompt_adapter import adapt_system_prompt, adapt_user_prompt
@@ -346,7 +457,17 @@ def read_page(
                 return _postprocess_output(line_text, domain=domain) if postprocess else line_text
         # Fall through to whole-page read if line segmentation fails
 
-    p = get_provider(provider)
+    # Stage 4: when a writer-specific TrOCR checkpoint exists for this writer,
+    # load THAT instead of the base singleton. Skipped silently for non-trocr
+    # providers (cloud VLMs don't have per-writer checkpoints) and for writers
+    # that haven't been fine-tuned yet (the base model still works).
+    p = None
+    if provider == "trocr" and writer_id:
+        from handwriting_engine.providers.trocr_provider import writer_checkpoint_dir
+        if writer_checkpoint_dir(writer_id).exists():
+            p = get_provider("trocr", writer_id=writer_id)
+    if p is None:
+        p = get_provider(provider)
 
     # S2: per-writer few-shot exemplars. Returns None (fall through) when the
     # writer has <2 GT samples, the provider is OCR-only, or HE_FEW_SHOT_K=0.
@@ -569,7 +690,6 @@ def read_with_consensus(
     Read a page using multi-model consensus.
     """
     from handwriting_engine.optimize import validate_and_prepare_image
-    from handwriting_engine.handwriting import get_reading_strategies
     from handwriting_engine.consensus import read_with_consensus as _consensus
 
     # Auto-classify handwriting style for content-type-aware provider routing
@@ -608,34 +728,22 @@ def read_with_consensus(
         from handwriting_engine.writer_profile_store import WriterProfileStore
         writer_profile_dict = WriterProfileStore().load(writer_id)
 
-    # Reading strategies go in system prompt for better model attention + caching
-    system_prompt = ""
-    if inject_strategies:
-        strategies = get_reading_strategies(
-            domain=domain,
-            content_type=content_type,
-            writer_profile=writer_profile_dict,
-        )
-        system_prompt = strategies
+    # Assemble system prompt via shared helper for parity with read_page().
+    # Faint protocol is not assessed here (consensus path doesn't peek at
+    # quality before assembly) — pass empty so the cache key reflects that.
+    system_prompt, cache_key = _build_system_prompt(
+        domain=domain,
+        content_type=content_type,
+        writer_profile=writer_profile_dict,
+        faint_protocol="",
+        inject_lessons=inject_lessons,
+        writer_id=writer_id,
+        vocabulary_hints=vocabulary_hints,
+        inject_strategies=inject_strategies,
+    )
 
-    # Inject learned lessons from past corrections
-    if inject_lessons:
-        from handwriting_engine.lessons import build_lessons_prompt
-        lessons = build_lessons_prompt(category=domain)
-        if lessons:
-            system_prompt = system_prompt + "\n\n" + lessons if system_prompt else lessons
-
-    # Inject writer-specific calibration from lessons store (supplements WriterProfileStore)
-    if writer_id:
-        from handwriting_engine.lessons import load_writer_calibration
-        writer_cal = load_writer_calibration(writer_id)
-        if writer_cal:
-            system_prompt = (system_prompt + "\n\n" + writer_cal) if system_prompt else writer_cal
-
-    # Inject vocabulary hints (research sweet spot: 20-50 terms)
-    if vocabulary_hints:
-        hint_text = "Expected vocabulary includes: " + ", ".join(vocabulary_hints[:50])
-        system_prompt = (system_prompt + "\n\n" + hint_text) if system_prompt else hint_text
+    # Wire Gemini context cache when gemini is among the providers in this run
+    _maybe_enable_gemini_cache(system_prompt, cache_key, providers or available_providers())
 
     # For smart routing, assess image quality and pass to consensus
     quality_assessment = None
