@@ -606,6 +606,90 @@ def benchmark_sweep(provider, yes, db_path):
         click.echo(f"  {name:20s}: run_id={run_id}")
 
 
+@benchmark.command("tune-threshold")
+@click.option("--cloud-provider", default="gemini", show_default=True,
+              help="Provider name to use as the local-first escalation target.")
+@click.option("--writer", default=None,
+              help="Filter to a single writer (matches samples.student).")
+@click.option("--db-path", default=None, type=click.Path(),
+              help="Override database path (default: ~/.handwriting-engine/benchmark.db).")
+@click.option("--format", "fmt", default="table",
+              type=click.Choice(["table", "json"]), show_default=True)
+def benchmark_tune_threshold_cmd(cloud_provider, writer, db_path, fmt):
+    """Pareto sweep over local-first acceptance thresholds.
+
+    Replays the local-first decision retrospectively against stored
+    `provider='trocr'` and `provider=<cloud_provider>` outputs to plot
+    CER vs cloud-call rate. Marks the Pareto frontier and recommends
+    a knee point that minimizes ``cer + 0.5 * cloud_call_rate`` —
+    a Lagrangian-ish tradeoff weighting one unit of cloud usage at
+    half a unit of CER.
+
+    Use the recommended threshold via ``HE_LOCAL_FIRST_THRESHOLD``
+    or by passing ``threshold=`` to ``read_local_first``.
+    """
+    from dataclasses import asdict
+    from handwriting_engine.threshold_tuner import (
+        pareto_frontier, pick_knee, sweep_thresholds,
+    )
+
+    points = sweep_thresholds(
+        db_path=db_path, cloud_provider=cloud_provider, writer_id=writer,
+    )
+
+    n_paired = points[0].n_samples if points else 0
+    if n_paired < 10:
+        click.echo(
+            f"Not enough paired (trocr, {cloud_provider}) samples in DB "
+            f"to tune threshold (found {n_paired}, need >=10). "
+            "Run `benchmark sweep` against both providers and ensure "
+            "ground truth is present, then retry."
+        )
+        return
+
+    frontier_set = {id(p) for p in pareto_frontier(points)}
+    knee = pick_knee([p for p in points if id(p) in frontier_set])
+
+    if fmt == "json":
+        payload = {
+            "cloud_provider": cloud_provider,
+            "writer": writer,
+            "points": [
+                {**asdict(p), "pareto": id(p) in frontier_set}
+                for p in points
+            ],
+            "recommended_threshold": knee.threshold if knee else None,
+        }
+        click.echo(json.dumps(payload, indent=2))
+        return
+
+    # Table format
+    sorted_points = sorted(points, key=lambda p: p.threshold)
+    click.echo(
+        f"\nThreshold sweep (cloud_provider={cloud_provider}"
+        f"{f', writer={writer}' if writer else ''}, n={n_paired}):\n"
+    )
+    click.echo(f"  {'thresh':>7}  {'CER %':>7}  {'cloud %':>8}  {'samples':>8}  pareto")
+    click.echo(f"  {'-'*7}  {'-'*7}  {'-'*8}  {'-'*8}  {'-'*6}")
+    for p in sorted_points:
+        is_pareto = id(p) in frontier_set
+        marker = "*" if is_pareto else " "
+        click.echo(
+            f"  {p.threshold:>7.2f}  "
+            f"{p.cer * 100:>7.2f}  "
+            f"{p.cloud_call_rate * 100:>8.2f}  "
+            f"{p.n_samples:>8d}  "
+            f"{marker}"
+        )
+    click.echo("\n  (* = Pareto-optimal: no other point beats it on both CER and cloud-call rate)")
+    if knee:
+        click.echo(
+            f"\nRecommended: threshold={knee.threshold:.2f} "
+            f"(knee of Pareto frontier; CER={knee.cer * 100:.2f}%, "
+            f"cloud-call rate={knee.cloud_call_rate * 100:.2f}%)"
+        )
+
+
 @benchmark.command("report")
 @click.option("--run-id", "-r", default=None, type=int, help="Specific run (default: latest)")
 @click.option("--format", "fmt", default="table", type=click.Choice(["table", "json", "csv"]))

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
+from click.testing import CliRunner
 
 from handwriting_engine.benchmark.db import (
     get_connection,
@@ -304,3 +307,78 @@ class TestPickKnee:
         assert pick_knee([]) is None
 
 
+# ---------- CLI wiring ----------
+
+
+class TestCliTuneThreshold:
+    def test_help_advertises_subcommand(self):
+        from handwriting_engine.cli import cli
+        runner = CliRunner()
+        result = runner.invoke(cli, ["benchmark", "tune-threshold", "--help"])
+        assert result.exit_code == 0, result.output
+        assert "--cloud-provider" in result.output
+        assert "--writer" in result.output
+        assert "--format" in result.output
+
+    def test_insufficient_data_message(self, tmp_path):
+        from handwriting_engine.cli import cli
+        # Empty DB → fewer than 10 paired samples.
+        db_path = tmp_path / "empty.db"
+        get_connection(db_path).close()
+        runner = CliRunner()
+        result = runner.invoke(cli, [
+            "benchmark", "tune-threshold", "--db-path", str(db_path),
+        ])
+        assert result.exit_code == 0, result.output
+        assert "Not enough paired" in result.output
+
+    def test_table_output_with_seeded_data(self, tmp_path):
+        from handwriting_engine.cli import cli
+        # Seed 10 paired samples to clear the >=10 gate.
+        db_path = tmp_path / "ten.db"
+        conn = get_connection(db_path)
+        run_id = insert_run(conn, label="cli", providers=["trocr", "gemini"])
+        gt = "the quick brown fox"
+        for i in range(10):
+            _seed_pair(
+                conn, run_id=run_id, image_hash=f"h{i}", gt_text=gt,
+                trocr_text="the quack brown fox",
+                trocr_conf=0.30 + 0.06 * i,
+                cloud_text=gt,
+            )
+        conn.close()
+
+        runner = CliRunner()
+        result = runner.invoke(cli, [
+            "benchmark", "tune-threshold", "--db-path", str(db_path),
+        ])
+        assert result.exit_code == 0, result.output
+        assert "Recommended:" in result.output
+        assert "Pareto" in result.output
+
+    def test_json_format(self, tmp_path):
+        from handwriting_engine.cli import cli
+        db_path = tmp_path / "json.db"
+        conn = get_connection(db_path)
+        run_id = insert_run(conn, label="j", providers=["trocr", "gemini"])
+        gt = "the quick brown fox"
+        for i in range(10):
+            _seed_pair(
+                conn, run_id=run_id, image_hash=f"h{i}", gt_text=gt,
+                trocr_text="the quack brown fox",
+                trocr_conf=0.30 + 0.06 * i,
+                cloud_text=gt,
+            )
+        conn.close()
+
+        runner = CliRunner()
+        result = runner.invoke(cli, [
+            "benchmark", "tune-threshold",
+            "--db-path", str(db_path), "--format", "json",
+        ])
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert payload["cloud_provider"] == "gemini"
+        assert "points" in payload
+        assert payload["recommended_threshold"] is not None
+        assert any(p["pareto"] for p in payload["points"])
