@@ -7,6 +7,7 @@ computes CER/WER, and stores everything in the database.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 from pathlib import Path
@@ -83,15 +84,55 @@ def _available_providers() -> list[str]:
         return []
 
 
+def _hash_str(s: str) -> str:
+    """Short stable hash for cache keys."""
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()[:16]
+
+
 def _read_single(
     image_path: str, provider: str, domain: str,
     auto_enhance: bool = False, inject_lessons: bool = False,
     enhance_strategy: str | None = None,
     line_level: bool = False,
     auto_retry: bool = False,
+    prompt: str = "",
+    system_prompt: str = "",
+    read_cache: dict | None = None,
 ) -> dict:
-    """Read a single image with one provider. Returns result dict."""
+    """Read a single image with one provider. Returns result dict.
+
+    If ``read_cache`` is provided, identical (image, provider, prompt, ...)
+    queries reuse the first call's text/confidence and report 0 tokens —
+    the work was already paid for by the strategy that ran first. Cached
+    rows are flagged with ``cached: True`` so reporting can distinguish
+    them from genuinely-zero-token providers (e.g. trocr_local).
+    """
     from handwriting_engine.vision import read_page
+
+    cache_key = None
+    if read_cache is not None:
+        cache_key = (
+            image_path,
+            provider,
+            _hash_str(prompt),
+            _hash_str(system_prompt),
+            bool(auto_enhance),
+            bool(inject_lessons),
+            enhance_strategy,
+            bool(line_level),
+            bool(auto_retry),
+        )
+        hit = read_cache.get(cache_key)
+        if hit is not None:
+            return {
+                "text": hit["text"],
+                "confidence": hit["confidence"],
+                "latency_ms": hit["latency_ms"],
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "error": hit["error"],
+                "cached": True,
+            }
 
     # Optionally enhance before reading (matches production pipeline)
     # Always write to a temp file to avoid corrupting benchmark source images
@@ -149,6 +190,66 @@ def _read_single(
     except Exception:
         pass
 
+    result = {
+        "text": text,
+        "confidence": confidence,
+        "latency_ms": latency_ms,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "error": error,
+        "cached": False,
+    }
+
+    if cache_key is not None:
+        # Store the original-paid result so subsequent strategies can replay it
+        # without re-charging tokens. Token counts are intentionally NOT cached
+        # — they belong to this strategy only; cached hits return 0/0.
+        read_cache[cache_key] = {
+            "text": text,
+            "confidence": confidence,
+            "latency_ms": latency_ms,
+            "error": error,
+        }
+
+    return result
+
+
+def _read_local_first(
+    image_path: str, providers: list[str], domain: str,
+) -> dict:
+    """Run the local_first strategy: TrOCR with cloud-fallback escalation.
+
+    ``providers`` must list ``trocr`` plus exactly one cloud fallback (e.g.
+    ``["trocr", "gemini"]``). Order is normalized — trocr is always the local
+    leg, the other entry is the escalation target.
+    """
+    from handwriting_engine.local_first import read_local_first
+
+    fallback = next((p for p in providers if p != "trocr"), None)
+    if fallback is None:
+        return {
+            "text": "", "confidence": 0.0, "latency_ms": 0,
+            "input_tokens": 0, "output_tokens": 0,
+            "error": "local_first requires a non-trocr fallback provider",
+        }
+
+    start = time.monotonic()
+    error = None
+    text = ""
+    confidence = 0.0
+    input_tokens = output_tokens = 0
+
+    try:
+        res = read_local_first(image_path, fallback_provider=fallback, domain=domain)
+        text = res.text
+        confidence = res.confidence
+        input_tokens = res.input_tokens
+        output_tokens = res.output_tokens
+    except Exception as e:
+        error = f"{type(e).__name__}: {e}"
+        logger.warning("local_first failed on %s: %s", image_path, error)
+
+    latency_ms = int((time.monotonic() - start) * 1000)
     return {
         "text": text,
         "confidence": confidence,
@@ -160,9 +261,45 @@ def _read_single(
 
 
 def _read_consensus(
-    image_path: str, providers: list[str], strategy: str, domain: str
+    image_path: str, providers: list[str], strategy: str, domain: str,
+    read_cache: dict | None = None,
 ) -> dict:
-    """Read with a consensus strategy. Returns result dict."""
+    """Read with a consensus strategy. Returns result dict.
+
+    Honors ``read_cache`` the same way as ``_read_single`` — provider key
+    becomes the joined string (e.g. ``"gemini+claude"``).
+    """
+    # local_first is multi-provider but not a consensus strategy — route it
+    # through its own helper so it can use TrOCR's logprob confidence to gate
+    # the cloud call.
+    if strategy == "local_first":
+        return _read_local_first(image_path, providers, domain)
+
+    cache_key = None
+    if read_cache is not None:
+        cache_key = (
+            image_path,
+            "+".join(providers),
+            _hash_str(strategy),
+            _hash_str(""),  # system_prompt placeholder
+            False,          # auto_enhance — not a consensus knob
+            False,          # inject_lessons — not a consensus knob
+            None,           # enhance_strategy
+            False,          # line_level
+            False,          # auto_retry
+        )
+        hit = read_cache.get(cache_key)
+        if hit is not None:
+            return {
+                "text": hit["text"],
+                "confidence": hit["confidence"],
+                "latency_ms": hit["latency_ms"],
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "error": hit["error"],
+                "cached": True,
+            }
+
     from handwriting_engine.vision import read_with_consensus
 
     start = time.monotonic()
@@ -196,14 +333,25 @@ def _read_consensus(
 
     latency_ms = int((time.monotonic() - start) * 1000)
 
-    return {
+    out = {
         "text": text,
         "confidence": confidence,
         "latency_ms": latency_ms,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "error": error,
+        "cached": False,
     }
+
+    if cache_key is not None:
+        read_cache[cache_key] = {
+            "text": text,
+            "confidence": confidence,
+            "latency_ms": latency_ms,
+            "error": error,
+        }
+
+    return out
 
 
 def run_benchmark(
@@ -223,6 +371,8 @@ def run_benchmark(
     vocab_hints_off: int = 0,
     line_level: bool = False,
     auto_retry: bool = False,
+    skip_single_provider: bool = False,
+    read_cache: dict | None = None,
 ) -> int:
     """Execute a full benchmark run.
 
@@ -260,6 +410,8 @@ def run_benchmark(
             vocab_hints_off=vocab_hints_off,
             line_level=line_level,
             auto_retry=auto_retry,
+            skip_single_provider=skip_single_provider,
+            read_cache=read_cache,
         )
     finally:
         conn.close()
@@ -282,6 +434,8 @@ def _run_benchmark_inner(
     vocab_hints_off: int = 0,
     line_level: bool = False,
     auto_retry: bool = False,
+    skip_single_provider: bool = False,
+    read_cache: dict | None = None,
 ) -> int:
     """Inner benchmark logic with connection managed by caller."""
     # Resolve providers
@@ -341,12 +495,18 @@ def _run_benchmark_inner(
             on_progress(i + 1, total, f"Sample {sample.id} ({sample.student or 'unknown'})")
 
         # Single-provider reads
-        for provider in providers:
+        # local_first runs intentionally skip the per-provider baselines
+        # because trocr_local + the cloud strategies already record those
+        # rows on separate sweep entries; running them here would double
+        # the cost without adding new measurements.
+        single_iter = [] if skip_single_provider else providers
+        for provider in single_iter:
             result = _read_single(
                 sample.image_path, provider, domain,
                 auto_enhance, inject_lessons, enhance_strategy,
                 line_level=line_level,
                 auto_retry=auto_retry,
+                read_cache=read_cache,
             )
             # Compute marker rate from raw text BEFORE any normalization
             raw_text = result["text"]
@@ -381,7 +541,10 @@ def _run_benchmark_inner(
         # Consensus strategies (need 2+ providers)
         if len(providers) >= 2:
             for strategy in strategies:
-                result = _read_consensus(sample.image_path, providers, strategy, domain)
+                result = _read_consensus(
+                    sample.image_path, providers, strategy, domain,
+                    read_cache=read_cache,
+                )
                 provider_label = "+".join(providers)
                 # Compute marker rate from RAW text BEFORE character_error_rate() normalizes it
                 # CRITICAL: normalize_text() in metrics.py strips [?] — must capture here
@@ -564,7 +727,43 @@ SWEEP_STRATEGIES = [
         "label": "sweep:zoomed_verify",
         "kwargs": {"strategies": [], "auto_retry": True},
     },
+    {
+        # Local OCR via TrOCR (microsoft/trocr-base-handwritten). Zero API tokens.
+        # Provider override: ignores the sweep's --provider flag because the
+        # whole point of this row is "what would CER look like with no cloud?".
+        "name": "trocr_local",
+        "label": "sweep:trocr_local",
+        "providers": ["trocr"],
+        "kwargs": {"strategies": []},
+        "cost_class": "local",
+    },
+    {
+        # Confidence-routed local-first: TrOCR handles easy lines, escalates
+        # to Gemini when mean-token-logprob falls below HE_LOCAL_FIRST_THRESHOLD.
+        # Mixed cost — most lines free, escalations charged at the cloud rate.
+        "name": "local_first_gemini",
+        "label": "sweep:local_first_gemini",
+        "providers": ["trocr", "gemini"],
+        "kwargs": {"strategies": ["local_first"], "skip_single_provider": True},
+        "cost_class": "mixed",
+        "cost_provider": "gemini",
+    },
+    {
+        # Same as above but escalates to Claude — useful when comparing
+        # which fallback model best resolves TrOCR's residual hard lines.
+        "name": "local_first_claude",
+        "label": "sweep:local_first_claude",
+        "providers": ["trocr", "claude"],
+        "kwargs": {"strategies": ["local_first"], "skip_single_provider": True},
+        "cost_class": "mixed",
+        "cost_provider": "claude",
+    },
 ]
+
+
+def _strategy_providers(config: dict, default_provider: str) -> list[str]:
+    """Resolve providers for a sweep strategy: per-strategy override > sweep default."""
+    return list(config.get("providers") or [default_provider])
 
 
 def run_sweep(
@@ -572,42 +771,73 @@ def run_sweep(
     db_path: Path | str | None = None,
     yes: bool = False,
     on_progress: Callable[[int, int, str], None] | None = None,
+    category: str | None = None,
 ) -> dict[str, int]:
-    """Execute all 5 sweep strategies against IAM samples (IAM-02).
+    """Execute all sweep strategies against samples in a category.
 
-    Fetches IAM sample IDs (samples.category='iam' with ground truth) from the
-    DB and passes them to run_benchmark() once per strategy. Returns a dict
-    mapping strategy name to run_id.
+    Fetches sample IDs with ground truth from the DB (optionally filtered by
+    ``samples.category``) and passes them to run_benchmark() once per strategy.
+    Returns a dict mapping strategy name to run_id.
 
     Args:
         provider: Provider used for all strategies.
         db_path: Override database path.
         yes: Reserved for future per-strategy confirmation; CLI guards cost upstream.
         on_progress: Optional progress callback forwarded to run_benchmark.
+        category: Sample category to sweep (e.g. ``'iam'``, ``'lab'``). If
+            ``None``, sweeps every category — useful when the DB only holds
+            one dataset, or for cross-category exploratory runs.
 
     Returns:
-        Dict {strategy_name: run_id} with exactly 5 keys matching SWEEP_STRATEGIES.
+        Dict {strategy_name: run_id} — one entry per SWEEP_STRATEGIES row whose
+        provider(s) are installed. Strategies whose providers are missing
+        (e.g. ``trocr_local`` without transformers/torch) are skipped with a
+        warning rather than aborting the sweep.
     """
     conn = get_connection(db_path)
     try:
-        rows = conn.execute(
-            """SELECT DISTINCT s.id AS id FROM samples s
-               JOIN ground_truths gt ON gt.sample_id = s.id
-               WHERE s.category = 'iam'
-               ORDER BY s.id"""
-        ).fetchall()
+        if category is None:
+            rows = conn.execute(
+                """SELECT DISTINCT s.id AS id FROM samples s
+                   JOIN ground_truths gt ON gt.sample_id = s.id
+                   ORDER BY s.id"""
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT DISTINCT s.id AS id FROM samples s
+                   JOIN ground_truths gt ON gt.sample_id = s.id
+                   WHERE s.category = ?
+                   ORDER BY s.id""",
+                (category,),
+            ).fetchall()
         sample_ids = [r["id"] for r in rows]
     finally:
         conn.close()
 
     run_ids: dict[str, int] = {}
+    avail = set(_available_providers())
+    # Shared per-(image, provider, prompt) cache: the same baseline read is
+    # otherwise paid once per strategy. With one dict threaded across every
+    # run_benchmark() call, the second-and-later strategies replay the cached
+    # text/confidence at zero tokens.
+    read_cache: dict = {}
     for config in SWEEP_STRATEGIES:
+        strat_providers = _strategy_providers(config, provider)
+        missing = [p for p in strat_providers if p not in avail]
+        if missing:
+            logger.warning(
+                "Skipping sweep strategy %r: provider(s) %s unavailable. "
+                "Install the relevant SDK / extras (e.g. `pip install -e '.[trained-correction]'` for trocr).",
+                config["name"], missing,
+            )
+            continue
         run_id = run_benchmark(
             label=config["label"],
-            providers=[provider],
+            providers=strat_providers,
             sample_ids=sample_ids if sample_ids else None,
             db_path=db_path,
             on_progress=on_progress,
+            read_cache=read_cache,
             **config["kwargs"],
         )
         run_ids[config["name"]] = run_id
