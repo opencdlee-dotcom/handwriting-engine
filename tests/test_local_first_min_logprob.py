@@ -213,6 +213,73 @@ def test_explicit_min_token_threshold_overrides_env(
     assert res.escalated is True
 
 
+# ---------------------------------------------------------------------------
+# Full accuracy stack on cloud escalation leg (Task 3)
+# ---------------------------------------------------------------------------
+
+
+@patch("handwriting_engine.local_first.read_page")
+@patch("handwriting_engine.local_first.validate_and_prepare_image")
+@patch("handwriting_engine.local_first.get_provider")
+def test_escalation_uses_full_accuracy_stack_by_default(
+    mock_get_provider, mock_prepare, mock_read_page, image_path,
+):
+    """When escalation fires with no overrides, read_page must be called with
+    inject_lessons=True and auto_retry=True — the full accuracy stack on the
+    hard page that triggered escalation."""
+    mock_prepare.return_value = ("FAKE_B64", "image/png")
+    trocr = _make_trocr_with_token_conf("garbled", 0.10, 0.05)
+    cloud = MagicMock()
+    cloud.usage = {"input_tokens": 0, "output_tokens": 0}
+
+    def get_provider_side_effect(name, **kwargs):
+        return trocr if name == "trocr" else cloud
+    mock_get_provider.side_effect = get_provider_side_effect
+
+    def read_page_side_effect(*args, **kwargs):
+        cloud.usage = {"input_tokens": 200, "output_tokens": 80}
+        return "fixed line"
+    mock_read_page.side_effect = read_page_side_effect
+
+    res = read_local_first(image_path, fallback_provider="gemini", threshold=0.6)
+    assert res.escalated is True
+
+    mock_read_page.assert_called_once()
+    _, kwargs = mock_read_page.call_args
+    assert kwargs.get("inject_lessons") is True, (
+        "Cloud escalation leg must default to inject_lessons=True"
+    )
+    assert kwargs.get("auto_retry") is True, (
+        "Cloud escalation leg must default to auto_retry=True"
+    )
+
+
+@patch("handwriting_engine.local_first.read_page")
+@patch("handwriting_engine.local_first.validate_and_prepare_image")
+@patch("handwriting_engine.local_first.get_provider")
+def test_escalation_caller_can_opt_out_of_accuracy_stack(
+    mock_get_provider, mock_prepare, mock_read_page, image_path,
+):
+    """Callers can still opt out by passing inject_lessons=False / auto_retry=False."""
+    mock_prepare.return_value = ("FAKE_B64", "image/png")
+    trocr = _make_trocr_with_token_conf("garbled", 0.10, 0.05)
+    cloud = MagicMock()
+    cloud.usage = {"input_tokens": 0, "output_tokens": 0}
+
+    def get_provider_side_effect(name, **kwargs):
+        return trocr if name == "trocr" else cloud
+    mock_get_provider.side_effect = get_provider_side_effect
+    mock_read_page.return_value = "raw"
+
+    read_local_first(
+        image_path, fallback_provider="gemini", threshold=0.6,
+        inject_lessons=False, auto_retry=False,
+    )
+    _, kwargs = mock_read_page.call_args
+    assert kwargs.get("inject_lessons") is False
+    assert kwargs.get("auto_retry") is False
+
+
 def test_local_first_result_exposes_min_token_conf():
     """LocalFirstResult dataclass must expose local_min_token_confidence."""
     r = LocalFirstResult(

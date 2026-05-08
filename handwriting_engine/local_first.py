@@ -99,9 +99,9 @@ def read_local_first(
     threshold: float | None = None,
     min_token_threshold: float | None = None,
     domain: str = "biology",
-    inject_lessons: bool = False,
+    inject_lessons: bool = True,
     line_level: bool = False,
-    auto_retry: bool = False,
+    auto_retry: bool = True,
 ) -> LocalFirstResult:
     """Run TrOCR; escalate to cloud if mean OR min-token confidence is too low.
 
@@ -112,6 +112,15 @@ def read_local_first(
     The min-token gate catches single buried bad chars in otherwise confident
     lines (e.g. one wrong letter mid-word) that the sequence-mean averages away.
 
+    Cloud-leg accuracy stack: when escalation fires, the cloud ``read_page``
+    call defaults to ``inject_lessons=True`` and ``auto_retry=True`` — once
+    we've decided this page is too hard for TrOCR, the cloud call should run
+    with the FULL accuracy stack rather than a stripped-down config. The
+    extra cost is bounded (we only fire on hard pages) and the CER win on
+    those hard pages is what justifies escalating in the first place.
+    Callers can opt out by passing ``inject_lessons=False`` /
+    ``auto_retry=False`` explicitly.
+
     Args:
         image_path: Path to the page image.
         fallback_provider: Cloud provider name (e.g. "gemini", "claude") to
@@ -121,7 +130,9 @@ def read_local_first(
         min_token_threshold: Override the default 0.3 min-token threshold.
             None falls back to ``HE_LOCAL_FIRST_MIN_TOKEN_THRESHOLD`` env.
         domain, inject_lessons, line_level, auto_retry: forwarded to
-            ``read_page`` when escalation fires.
+            ``read_page`` when escalation fires. ``inject_lessons`` and
+            ``auto_retry`` default to True so the cloud leg uses the full
+            accuracy stack on the hard pages that triggered escalation.
 
     Returns:
         ``LocalFirstResult`` with text, confidence, token counts, and an
