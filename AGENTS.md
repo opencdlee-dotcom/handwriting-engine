@@ -8,6 +8,7 @@ Consolidates ~3,000 lines from 8 locations into one reusable library.
 - **Entry point**: `main.py` (click CLI) + `handwriting_engine/__init__.py` (library API)
 - **Core modules**: quality, enhance, pdf, optimize, crop, handwriting, models
 - **Providers**: claude, openai, gemini — each implements VisionProvider protocol
+- **Transcription vs. intelligence**: `vision.read_page` = flat verbatim text; `document_intelligence.analyze_document` = structured in-context interpretation (layout regions, tables-as-data, figures interpreted, equations, cross-content findings). The latter reuses the providers' previously-unused `read_structured` (tool-use / JSON-schema) path.
 - **Consensus**: vote/best_of/debate strategies for multi-model reads
 - **Benchmark**: `benchmark/` subpackage — SQLite ground-truth DB, CER/WER metrics, regression detection
 - **Prompt adaptation**: `prompt_adapter.py` — provider-specific prompt optimization (Gemini=concise, OpenAI=role+task, Claude=full)

@@ -62,7 +62,19 @@ CRISP_PRESETS = {
 
 # Default model names — pinned versions prevent silent regression
 # (GPT-4o-mini study showed WER doubling from 15% to 32% over 6 months with rolling model)
-DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-20250514"
+#
+# Two tiers, two jobs:
+#   - Transcription is a verbatim task. More reasoning HURTS it (see the Gemini
+#     thinking_budget=0 note below) — a model that "thinks" starts silently
+#     correcting the writer. So the transcription workhorse is a Sonnet-tier model.
+#   - Document intelligence (analyze_document) is the opposite: interpreting a
+#     chart/table/diagram *in context* is exactly what a deep-reasoning model is
+#     for. That path defaults to the Fable 5 tier via CLAUDE_INTELLIGENCE_MODEL.
+DEFAULT_CLAUDE_MODEL = "claude-sonnet-5"            # transcription workhorse (was claude-sonnet-4)
+CLAUDE_INTELLIGENCE_MODEL = "claude-fable-5"        # document intelligence / in-context interpretation
+CLAUDE_FAST_MODEL = "claude-haiku-4-5-20251001"     # cheap bulk transcription
+# NOTE: OpenAI/Gemini IDs left pinned to their last-verified releases. Bump them
+# only against confirmed current model IDs — a wrong string 404s the whole read.
 DEFAULT_OPENAI_MODEL = "gpt-4.1-2025-04-14"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 GEMINI_QUALITY_MODEL = "gemini-2.5-pro"  # For quality reads (better accuracy, higher cost)

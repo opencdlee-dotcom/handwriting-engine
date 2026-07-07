@@ -8,6 +8,7 @@ Consolidates ~3,000 lines from 8 locations into one reusable library.
 - **Entry point**: `main.py` (click CLI) + `handwriting_engine/__init__.py` (library API)
 - **Core modules**: quality, enhance, pdf, optimize, crop, handwriting, models
 - **Providers**: claude, openai, gemini — each implements VisionProvider protocol
+- **Transcription vs. intelligence**: `vision.read_page` = flat verbatim text; `document_intelligence.analyze_document` = structured in-context interpretation (layout regions, tables-as-data, figures interpreted, equations, cross-content findings). The latter reuses the providers' previously-unused `read_structured` (tool-use / JSON-schema) path.
 - **Consensus**: vote/best_of/debate strategies for multi-model reads
 - **Benchmark**: `benchmark/` subpackage — SQLite ground-truth DB, CER/WER metrics, regression detection
 - **Prompt adaptation**: `prompt_adapter.py` — provider-specific prompt optimization (Gemini=concise, OpenAI=role+task, Claude=full)
@@ -25,6 +26,8 @@ Consolidates ~3,000 lines from 8 locations into one reusable library.
 - **Tool-use structured output**: Claude's tool_choice="any" for reliable JSON (from LabNoteBookGrader)
 - **OpenAI detail="high"**: Best available for GPT-4.1 ("original" is GPT-5.4+ only)
 - **Lazy provider imports**: Missing SDK won't crash the engine
+- **Two model tiers, two jobs**: transcription (verbatim — reasoning HURTS it, cf. Gemini thinking_budget=0) defaults to the Sonnet-tier workhorse (`DEFAULT_CLAUDE_MODEL=claude-sonnet-5`); document intelligence (interpret in context) defaults to the Fable-5 tier (`CLAUDE_INTELLIGENCE_MODEL=claude-fable-5`). Claude text extraction scans for the first `text` block so a thinking block can't shadow the output.
+- **OpenAI/Gemini IDs intentionally not bumped**: leaving them pinned until confirmed against live model IDs — a wrong string 404s the whole read. Override via `OPENAI_MODEL`/`GEMINI_MODEL` env.
 - **Model versions pinned**: GPT-4.1-2025-04-14 prevents silent regression (WER doubled in 6mo with rolling models)
 - **Gemini context caching**: enable_context_cache() for 90% discount on batch workflows
 - **Confidence-weighted voting**: Consensus weights adjusted per-read by text quality signals

@@ -134,7 +134,7 @@ class ClaudeProvider:
                 if not response.content:
                     logger.warning("Claude returned empty response (possible safety refusal)")
                     return ""
-                return response.content[0].text
+                return self._first_text(response.content)
 
             except anthropic.BadRequestError as e:
                 if "Could not process image" in str(e) and attempt < retries - 1:
@@ -189,6 +189,20 @@ class ClaudeProvider:
                     continue
             new_content.append(block)
         return new_content
+
+    @staticmethod
+    def _first_text(content: list) -> str:
+        """Return the first text block's text.
+
+        Reasoning-capable models (e.g. Fable 5 with extended thinking) may emit a
+        ``thinking`` block before the ``text`` block, so ``content[0]`` is not
+        guaranteed to be text. Scan for the first block that actually carries text.
+        """
+        for block in content:
+            if getattr(block, "type", None) == "text":
+                return block.text
+        # No text block (e.g. tool_use / thinking only) — nothing to transcribe.
+        return ""
 
     def _accumulate(self, response):
         if hasattr(response, "usage"):
