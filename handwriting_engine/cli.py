@@ -190,6 +190,55 @@ def read(path, provider, domain, prompt, writer, fmt):
 
 
 @cli.command()
+@click.argument("path", type=click.Path(exists=True))
+@click.option("--provider", "-p", default="claude", type=click.Choice(["claude", "gemini", "openai"]),
+              help="Vision provider (claude recommended — richest schema support + Fable 5).")
+@click.option("--model", default=None, help="Model override (default: provider's intelligence tier, e.g. Fable 5).")
+@click.option("--domain", "-d", default="general", help="Domain hint folded into the prompt (e.g. biology).")
+@click.option("--format", "fmt", default="md", type=click.Choice(["md", "json"]),
+              help="Output shape: 'md' human report, 'json' structured payload.")
+@click.option("--instructions", default="", help="Extra guidance appended to the analysis prompt.")
+def analyze(path, provider, model, domain, fmt, instructions):
+    """Interpret a document (tables, charts, diagrams) — structured, in-context.
+
+    Unlike `read` (flat transcription), this extracts tables as data, interprets
+    figures in context, and reports cross-content findings.
+    """
+    from handwriting_engine.document_intelligence import analyze_document
+
+    if path.lower().endswith(".pdf"):
+        import tempfile
+        from handwriting_engine.pdf import convert_pdf
+        tmpdir = tempfile.mkdtemp(prefix="hwe_analyze_")
+        _temp_dirs.append(tmpdir)
+        pages = convert_pdf(path, tmpdir)
+        image_paths = [(p.get("page_number", i + 1), p["path"]) for i, p in enumerate(pages)]
+    else:
+        image_paths = [(1, path)]
+
+    analyses = []
+    for page_no, img in image_paths:
+        analysis = analyze_document(
+            img, provider=provider, model=model, domain=domain, extra_instructions=instructions,
+        )
+        analyses.append((page_no, analysis))
+
+    if fmt == "json":
+        click.echo(json.dumps({
+            "path": path,
+            "domain": domain,
+            "provider": provider,
+            "pages": [{"page_number": n, **a.to_dict()} for n, a in analyses],
+        }, indent=2))
+        return
+
+    for page_no, analysis in analyses:
+        if len(analyses) > 1:
+            click.echo(f"\n<!-- Page {page_no} -->\n")
+        click.echo(analysis.to_markdown())
+
+
+@cli.command()
 @click.argument("pdf_path", type=click.Path(exists=True))
 @click.option("--page", default=0, type=click.IntRange(0, 999), help="Page number (0-indexed)")
 @click.option("--questions", default=25, type=click.IntRange(1, 200), help="Number of questions (1-200)")

@@ -81,6 +81,24 @@ from handwriting_engine.models import (
 # Prompt adaptation
 from handwriting_engine.prompt_adapter import adapt_system_prompt, adapt_user_prompt
 
+# Document intelligence — structured, in-context interpretation (tables, charts,
+# diagrams) rather than flat transcription. Types import cheaply (no SDK cost);
+# the entry points are lazy so a missing API key never breaks `import`.
+from handwriting_engine.document_intelligence import (
+    DocumentAnalysis,
+    Table,
+    Figure,
+    Region,
+)
+
+def analyze_document(*args, **kwargs):
+    from handwriting_engine.document_intelligence import analyze_document as _ad
+    return _ad(*args, **kwargs)
+
+def analyze_pages(*args, **kwargs):
+    from handwriting_engine.document_intelligence import analyze_pages as _ap
+    return _ap(*args, **kwargs)
+
 # Vision (lazy — doesn't fail if no API keys)
 def read_page(*args, **kwargs):
     from handwriting_engine.vision import read_page as _rp
@@ -118,6 +136,8 @@ __all__ = [
     "HandwritingEngineError", "ProviderError", "ImageError", "ConfigError",
     # Prompt adaptation
     "adapt_system_prompt", "adapt_user_prompt",
+    # Document intelligence
+    "analyze_document", "analyze_pages", "DocumentAnalysis", "Table", "Figure", "Region",
     # Vision
     "read_page", "read_with_consensus",
     # Writer identification
