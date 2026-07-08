@@ -8,13 +8,13 @@ Consolidates ~3,000 lines from 8 locations into one reusable library.
 - **Entry point**: `main.py` (click CLI) + `handwriting_engine/__init__.py` (library API)
 - **Core modules**: quality, enhance, pdf, optimize, crop, handwriting, models
 - **Providers**: claude, openai, gemini — each implements VisionProvider protocol
-- **Transcription vs. intelligence**: `vision.read_page` = flat verbatim text; `document_intelligence.analyze_document` = structured in-context interpretation (layout regions, tables-as-data, figures interpreted, equations, cross-content findings). The latter reuses the providers' previously-unused `read_structured` (tool-use / JSON-schema) path.
+- **Transcription vs. intelligence**: `vision.read_page` = flat verbatim text; `document_intelligence.analyze_document` = structured in-context interpretation (layout regions, tables-as-data, figures interpreted, equations, cross-content findings); `document_intelligence.ask_document` = grounded Q&A (one question → answer + on-page evidence, far fewer output tokens than a full analysis; CLI `ask`). All three reuse the providers' `read_structured` (tool-use / JSON-schema) path.
 - **Consensus**: vote/best_of/debate strategies for multi-model reads
 - **Benchmark**: `benchmark/` subpackage — SQLite ground-truth DB, CER/WER metrics, regression detection
 - **Prompt adaptation**: `prompt_adapter.py` — provider-specific prompt optimization (Gemini=concise, OpenAI=role+task, Claude=full)
 - **Writer identification**: `writer_embeddings.py` — Gemini multimodal embeddings for automatic writer clustering
 - **Batch API**: `providers/batch_openai.py` — 50% cost OpenAI batch processing for benchmarks
-- **Config**: `_constants.py` (defaults) + `config.py` (loads .env)
+- **Config**: `_constants.py` (defaults); the CLI autoloads a `.env` at startup via `python-dotenv` (non-override — an exported var still wins), so `ANTHROPIC_API_KEY` etc. need no manual `export`
 
 ## Key Design Decisions
 - **Multi-model consensus**: Gemini best overall (1.67% CER), Claude for layouts, GPT for disambiguation
@@ -27,6 +27,7 @@ Consolidates ~3,000 lines from 8 locations into one reusable library.
 - **OpenAI detail="high"**: Best available for GPT-4.1 ("original" is GPT-5.4+ only)
 - **Lazy provider imports**: Missing SDK won't crash the engine
 - **Two model tiers, two jobs**: transcription (verbatim — reasoning HURTS it, cf. Gemini thinking_budget=0) defaults to the Sonnet-tier workhorse (`DEFAULT_CLAUDE_MODEL=claude-sonnet-5`); document intelligence (interpret in context) defaults to the Fable-5 tier (`CLAUDE_INTELLIGENCE_MODEL=claude-fable-5`). Claude text extraction scans for the first `text` block so a thinking block can't shadow the output.
+- **Thinking-enabled document intelligence**: `tool_choice:"any"` disables extended thinking, so `analyze_document` runs a thinking pass (`tool_choice:"auto"`, `INTELLIGENCE_THINKING_BUDGET=4096`) with automatic fallback to the forced-tool call if the model skips the tool or the API rejects thinking params. `analyze_document_set` sends all pages (≤20) in ONE call with "Page N" labels for cross-page reasoning (`--whole-doc` in the CLI).
 - **OpenAI/Gemini IDs intentionally not bumped**: leaving them pinned until confirmed against live model IDs — a wrong string 404s the whole read. Override via `OPENAI_MODEL`/`GEMINI_MODEL` env.
 - **Model versions pinned**: GPT-4.1-2025-04-14 prevents silent regression (WER doubled in 6mo with rolling models)
 - **Gemini context caching**: enable_context_cache() for 90% discount on batch workflows

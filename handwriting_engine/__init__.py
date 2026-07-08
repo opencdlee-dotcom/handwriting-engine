@@ -89,6 +89,7 @@ from handwriting_engine.document_intelligence import (
     Table,
     Figure,
     Region,
+    QuestionAnswer,
 )
 
 def analyze_document(*args, **kwargs):
@@ -98,6 +99,14 @@ def analyze_document(*args, **kwargs):
 def analyze_pages(*args, **kwargs):
     from handwriting_engine.document_intelligence import analyze_pages as _ap
     return _ap(*args, **kwargs)
+
+def analyze_document_set(*args, **kwargs):
+    from handwriting_engine.document_intelligence import analyze_document_set as _ads
+    return _ads(*args, **kwargs)
+
+def ask_document(*args, **kwargs):
+    from handwriting_engine.document_intelligence import ask_document as _ask
+    return _ask(*args, **kwargs)
 
 # Vision (lazy — doesn't fail if no API keys)
 def read_page(*args, **kwargs):
@@ -137,7 +146,8 @@ __all__ = [
     # Prompt adaptation
     "adapt_system_prompt", "adapt_user_prompt",
     # Document intelligence
-    "analyze_document", "analyze_pages", "DocumentAnalysis", "Table", "Figure", "Region",
+    "analyze_document", "analyze_pages", "analyze_document_set", "ask_document",
+    "DocumentAnalysis", "Table", "Figure", "Region", "QuestionAnswer",
     # Vision
     "read_page", "read_with_consensus",
     # Writer identification

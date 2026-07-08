@@ -73,6 +73,11 @@ CRISP_PRESETS = {
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-5"            # transcription workhorse (was claude-sonnet-4)
 CLAUDE_INTELLIGENCE_MODEL = "claude-fable-5"        # document intelligence / in-context interpretation
 CLAUDE_FAST_MODEL = "claude-haiku-4-5-20251001"     # cheap bulk transcription
+# Extended-thinking budget for the document-intelligence path (Claude only).
+# tool_choice:"any" disables thinking, so analyze_document routes through a
+# thinking-enabled tool_choice:"auto" pass — this is how many tokens it may
+# reason with before filling the schema. 0 disables the thinking pass.
+INTELLIGENCE_THINKING_BUDGET = 4096
 # NOTE: OpenAI/Gemini IDs left pinned to their last-verified releases. Bump them
 # only against confirmed current model IDs — a wrong string 404s the whole read.
 DEFAULT_OPENAI_MODEL = "gpt-4.1-2025-04-14"

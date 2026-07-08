@@ -4,9 +4,11 @@ import pytest
 
 from handwriting_engine import document_intelligence as di
 from handwriting_engine.document_intelligence import (
-    DocumentAnalysis, Table, Figure, Region,
-    analyze_document, analyze_pages, build_core_schema, _package_schema_for,
+    DocumentAnalysis, Table, Figure, Region, QuestionAnswer,
+    analyze_document, analyze_pages, analyze_document_set, ask_document,
+    build_core_schema, build_qa_schema, _package_schema_for, MAX_DOC_SET_PAGES,
 )
+from handwriting_engine._constants import INTELLIGENCE_THINKING_BUDGET
 from handwriting_engine.models import ProviderError, ImageError
 from handwriting_engine import providers as providers_pkg
 
@@ -263,3 +265,224 @@ def test_analyze_pages_isolates_failures(tmp_image):
     assert results[0].document_type == "lab_notebook"
     assert results[1].document_type == "error"
     assert results[1].uncertainties  # records the failure
+
+
+# --- page / axes fields -------------------------------------------------------
+
+def test_from_dict_parses_page_and_axes():
+    raw = {
+        "regions": [{"type": "table", "content": "data", "page": 2}],
+        "tables": [{"columns": ["a"], "rows": [], "page": "3"}],  # string page tolerated
+        "figures": [{
+            "kind": "chart", "description": "pH curve", "page": 3,
+            "axes": {"x": "volume (mL)", "y": "pH"},
+        }],
+    }
+    a = DocumentAnalysis.from_dict(raw)
+    assert a.regions[0].page == 2
+    assert a.tables[0].page == 3
+    assert a.figures[0].page == 3
+    assert a.figures[0].axes == {"x": "volume (mL)", "y": "pH"}
+
+
+def test_from_dict_garbage_page_and_axes_are_safe():
+    raw = {
+        "tables": [{"columns": [], "rows": [], "page": "not-a-number"}],
+        "figures": [{"kind": "chart", "description": "d", "axes": "x vs y"}],
+    }
+    a = DocumentAnalysis.from_dict(raw)
+    assert a.tables[0].page == 0
+    assert a.figures[0].axes == {}
+
+
+def test_to_markdown_renders_page_and_axes():
+    a = DocumentAnalysis(
+        document_type="report", summary="s", full_text="f",
+        tables=[Table(title="T", columns=["a"], rows=[["1"]], page=2)],
+        figures=[Figure(kind="chart", description="d", page=3,
+                        axes={"x": "volume (mL)", "y": "pH"})],
+    )
+    md = a.to_markdown()
+    assert "## Table: T (p. 2)" in md
+    assert "(p. 3)" in md
+    assert "Axes: x = volume (mL), y = pH" in md
+
+
+# --- extended-thinking routing ------------------------------------------------
+
+class RecordingStructProvider(StructuredMockProvider):
+    """Class-level recording — analyze_document creates fresh (uncached) instances
+    when a model kwarg is passed, so instance attributes are unreachable after."""
+
+    last_call = None
+    call_count = 0
+
+    def read_structured(self, image_blocks, prompt, schema, system_prompt="",
+                        max_tokens=8192, **kwargs):
+        type(self).call_count += 1
+        type(self).last_call = {
+            "blocks": image_blocks, "prompt": prompt, "schema": schema,
+            "max_tokens": max_tokens, **kwargs,
+        }
+        return self._response
+
+
+@pytest.fixture()
+def claude_mock():
+    """Swap the recording mock in under the real 'claude' registry name."""
+    saved = providers_pkg._REGISTRY.get("claude")
+    RecordingStructProvider.last_call = None
+    RecordingStructProvider.call_count = 0
+    providers_pkg.register("claude", RecordingStructProvider)
+    providers_pkg._INSTANCES.pop("claude", None)
+    yield RecordingStructProvider
+    if saved is not None:
+        providers_pkg._REGISTRY["claude"] = saved
+    else:
+        providers_pkg._REGISTRY.pop("claude", None)
+    providers_pkg._INSTANCES.pop("claude", None)
+
+
+def test_claude_gets_default_thinking_budget(tmp_image, claude_mock):
+    analyze_document(tmp_image(), provider="claude")
+    assert claude_mock.last_call["thinking_budget"] == INTELLIGENCE_THINKING_BUDGET
+
+
+def test_thinking_budget_zero_disables(tmp_image, claude_mock):
+    analyze_document(tmp_image(), provider="claude", thinking_budget=0)
+    assert "thinking_budget" not in claude_mock.last_call
+
+
+def test_thinking_budget_not_forwarded_to_other_providers(tmp_image):
+    # mockstruct.read_structured takes no thinking kwarg — forwarding would TypeError.
+    a = analyze_document(tmp_image(), provider="mockstruct", thinking_budget=1234)
+    assert a.document_type == "lab_notebook"
+
+
+# --- analyze_document_set (whole-document, cross-page) --------------------------
+
+def test_analyze_document_set_interleaves_page_labels(tmp_image, claude_mock):
+    a = analyze_document_set([tmp_image(), tmp_image()], provider="claude")
+    blocks = claude_mock.last_call["blocks"]
+    assert [b["type"] for b in blocks] == ["text", "image", "text", "image"]
+    assert blocks[0]["text"] == "Page 1 of 2:"
+    assert blocks[2]["text"] == "Page 2 of 2:"
+    prompt = claude_mock.last_call["prompt"]
+    assert "consecutive pages of ONE document" in prompt
+    assert "--- Page N ---" in prompt
+    assert "Reason ACROSS pages" in prompt
+    assert a.document_type == "lab_notebook"
+    # Whole-doc analysis keeps the thinking pass on by default.
+    assert claude_mock.last_call["thinking_budget"] == INTELLIGENCE_THINKING_BUDGET
+
+
+def test_analyze_document_set_empty_raises():
+    with pytest.raises(ValueError, match="at least one"):
+        analyze_document_set([], provider="mockstruct")
+
+
+def test_analyze_document_set_caps_pages():
+    too_many = [f"/fake/page-{i}.jpg" for i in range(MAX_DOC_SET_PAGES + 1)]
+    with pytest.raises(ValueError, match="capped"):
+        analyze_document_set(too_many, provider="mockstruct")
+
+
+def test_whole_doc_is_one_call_vs_per_page_is_n(tmp_image, claude_mock):
+    """Tangible token-efficiency proof: whole-doc analysis is ONE provider call
+    (one prompt, one thinking budget) where per-page is N."""
+    imgs = [tmp_image(), tmp_image(), tmp_image()]
+
+    claude_mock.call_count = 0
+    analyze_document_set(imgs, provider="claude")
+    assert claude_mock.call_count == 1
+
+    claude_mock.call_count = 0
+    analyze_pages(imgs, provider="claude")
+    assert claude_mock.call_count == 3
+
+
+# --- ask_document (grounded Q&A) ----------------------------------------------
+
+QA_RAW = {
+    "answer": "The equivalence point is about 12.5 mL.",
+    "answerable": True,
+    "supported_by": ["Table note: mean 12.5 mL", "Figure: equivalence near 12.5 mL"],
+    "confidence": "high",
+    "uncertainties": [],
+}
+
+
+class QAMockProvider(StructuredMockProvider):
+    name = "mockqa"
+
+    def __init__(self, model=None, **kwargs):
+        super().__init__(model=model, response=QA_RAW, **kwargs)
+
+
+@pytest.fixture()
+def _register_qa():
+    providers_pkg.register("mockqa", QAMockProvider)
+    providers_pkg._INSTANCES.pop("mockqa", None)
+    yield
+    providers_pkg._REGISTRY.pop("mockqa", None)
+    providers_pkg._INSTANCES.pop("mockqa", None)
+
+
+def test_qa_schema_shape():
+    s = build_qa_schema()
+    assert s["properties"]["answerable"]["type"] == "boolean"
+    assert "answer" in s["required"] and "answerable" in s["required"]
+
+
+def test_ask_document_happy_path(tmp_image, _register_qa):
+    qa = ask_document(tmp_image(), "What is the equivalence point?", provider="mockqa")
+    assert isinstance(qa, QuestionAnswer)
+    assert qa.answerable is True
+    assert "12.5 mL" in qa.answer
+    assert qa.confidence == "high"
+    assert len(qa.supported_by) == 2
+    assert qa.question == "What is the equivalence point?"
+
+
+def test_ask_document_not_answerable(tmp_image):
+    resp = {"answer": "The page doesn't mention pH.", "answerable": False, "supported_by": []}
+    providers_pkg.register(
+        "mocknoans",
+        type("N", (StructuredMockProvider,),
+             {"read_structured": lambda self, *a, **k: resp}),
+    )
+    providers_pkg._INSTANCES.pop("mocknoans", None)
+    qa = ask_document(tmp_image(), "What was the pH?", provider="mocknoans")
+    assert qa.answerable is False
+    assert "not answerable" in qa.to_markdown().lower()
+    providers_pkg._REGISTRY.pop("mocknoans", None)
+    providers_pkg._INSTANCES.pop("mocknoans", None)
+
+
+def test_ask_document_empty_question_raises(tmp_image):
+    with pytest.raises(ValueError, match="non-empty question"):
+        ask_document(tmp_image(), "   ", provider="mockqa")
+
+
+def test_ask_document_no_pages_raises():
+    with pytest.raises(ValueError, match="at least one"):
+        ask_document([], "anything?", provider="mockqa")
+
+
+def test_ask_document_without_read_structured_raises(tmp_image):
+    with pytest.raises(ProviderError, match="read_structured"):
+        ask_document(tmp_image(), "q?", provider="mockplain")
+
+
+def test_ask_document_single_image_has_no_page_labels(tmp_image, claude_mock):
+    ask_document(tmp_image(), "q?", provider="claude")
+    blocks = claude_mock.last_call["blocks"]
+    assert [b["type"] for b in blocks] == ["image"]  # no "Page N" text block for one page
+    assert claude_mock.last_call["thinking_budget"] == INTELLIGENCE_THINKING_BUDGET
+
+
+def test_ask_document_multipage_interleaves_labels(tmp_image, claude_mock):
+    ask_document([tmp_image(), tmp_image()], "q?", provider="claude")
+    blocks = claude_mock.last_call["blocks"]
+    assert [b["type"] for b in blocks] == ["text", "image", "text", "image"]
+    assert blocks[0]["text"] == "Page 1 of 2:"

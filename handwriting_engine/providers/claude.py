@@ -15,12 +15,27 @@ from handwriting_engine._constants import (
     RETRY_MAX_LONG_SIDE,
     RETRY_JPEG_QUALITY,
 )
+from handwriting_engine.providers.base import retry_api_call
 
 logger = logging.getLogger(__name__)
 
 
 class ClaudeProvider:
     name = "claude"
+
+    @staticmethod
+    def _retryable_exceptions() -> tuple:
+        """Transient API failures worth retrying (matches the openai provider).
+
+        A Cloudflare 502 surfaces as ``anthropic.InternalServerError`` — without
+        this an expensive multi-page structured call dies on a momentary blip.
+        """
+        import anthropic
+        return (
+            anthropic.RateLimitError,
+            anthropic.APIConnectionError,
+            anthropic.InternalServerError,
+        )
 
     def __init__(self, api_key: str | None = None, model: str | None = None):
         try:
@@ -70,33 +85,76 @@ class ClaudeProvider:
         tool_schema: dict,
         system_prompt: str = "",
         max_tokens: int = 8192,
+        thinking_budget: int = 0,
     ) -> dict:
-        """Use Claude's tool-use for 100% reliable structured output (LabNoteBookGrader pattern)."""
+        """Use Claude's tool-use for 100% reliable structured output (LabNoteBookGrader pattern).
+
+        ``thinking_budget`` > 0 enables extended thinking before the tool call,
+        so the model reasons across the page(s) and THEN fills the schema —
+        the point of routing document intelligence to a deep-reasoning tier.
+        Thinking is incompatible with ``tool_choice: any`` and a forced
+        temperature, so the thinking pass uses ``auto`` and falls back to the
+        plain forced-tool call if the model skips the tool or the API rejects
+        the thinking params.
+        """
         import anthropic
 
         content = image_blocks + [{"type": "text", "text": prompt}]
-        kwargs = {
-            "model": self._model,
-            "max_tokens": max_tokens,
-            "temperature": 0,
-            "messages": [{"role": "user", "content": content}],
-            "tools": [tool_schema],
-            "tool_choice": {"type": "any"},
-        }
-        if system_prompt:
-            # Enable prompt caching for long system prompts (same as _call)
-            if len(system_prompt) > 4096:
-                kwargs["system"] = [
-                    {
-                        "type": "text",
-                        "text": system_prompt,
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ]
-            else:
-                kwargs["system"] = system_prompt
 
-        response = self._client.messages.create(**kwargs)
+        def _create(kw: dict):
+            # Retry transient failures (502/rate-limit/connection); a non-retryable
+            # error like BadRequestError propagates so the caller's fallback runs.
+            return retry_api_call(
+                lambda: self._client.messages.create(**kw),
+                retryable_exceptions=self._retryable_exceptions(),
+            )
+
+        def _base_kwargs() -> dict:
+            kwargs = {
+                "model": self._model,
+                "messages": [{"role": "user", "content": content}],
+                "tools": [tool_schema],
+            }
+            if system_prompt:
+                # Enable prompt caching for long system prompts (same as _call)
+                if len(system_prompt) > 4096:
+                    kwargs["system"] = [
+                        {
+                            "type": "text",
+                            "text": system_prompt,
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ]
+                else:
+                    kwargs["system"] = system_prompt
+            return kwargs
+
+        if thinking_budget > 0:
+            kwargs = _base_kwargs()
+            # Thinking tokens count toward max_tokens — grow the cap so the
+            # schema output keeps its full allowance.
+            kwargs["max_tokens"] = max_tokens + thinking_budget
+            kwargs["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
+            kwargs["tool_choice"] = {"type": "auto"}
+            try:
+                response = _create(kwargs)
+                self._accumulate(response)
+                for block in response.content:
+                    if block.type == "tool_use":
+                        return block.input
+                logger.warning(
+                    "Thinking pass returned no tool_use — retrying with forced tool call"
+                )
+            except anthropic.BadRequestError as e:
+                logger.warning(
+                    "Thinking-enabled structured call rejected (%s) — retrying without thinking", e
+                )
+
+        kwargs = _base_kwargs()
+        kwargs["max_tokens"] = max_tokens
+        kwargs["temperature"] = 0
+        kwargs["tool_choice"] = {"type": "any"}
+        response = _create(kwargs)
         self._accumulate(response)
 
         for block in response.content:

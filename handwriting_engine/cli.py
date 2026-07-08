@@ -12,6 +12,15 @@ import json
 import sys
 from pathlib import Path
 
+# Load .env so provider API keys (ANTHROPIC_API_KEY, etc.) are picked up without
+# a manual `export`. Non-override: an already-exported var wins over the file
+# (standard precedence), so the shell can still override .env per-run.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 # Track temp dirs for cleanup
 _temp_dirs: list[str] = []
 
@@ -189,6 +198,18 @@ def read(path, provider, domain, prompt, writer, fmt):
             click.echo(p["text"])
 
 
+def _to_page_images(path):
+    """Page image paths for a file: [(1, path)] for an image, one per page for a PDF."""
+    if path.lower().endswith(".pdf"):
+        import tempfile
+        from handwriting_engine.pdf import convert_pdf
+        tmpdir = tempfile.mkdtemp(prefix="hwe_analyze_")
+        _temp_dirs.append(tmpdir)
+        pages = convert_pdf(path, tmpdir)
+        return [(p.get("page_number", i + 1), p["path"]) for i, p in enumerate(pages)]
+    return [(1, path)]
+
+
 @cli.command()
 @click.argument("path", type=click.Path(exists=True))
 @click.option("--provider", "-p", default="claude", type=click.Choice(["claude", "gemini", "openai"]),
@@ -198,44 +219,81 @@ def read(path, provider, domain, prompt, writer, fmt):
 @click.option("--format", "fmt", default="md", type=click.Choice(["md", "json"]),
               help="Output shape: 'md' human report, 'json' structured payload.")
 @click.option("--instructions", default="", help="Extra guidance appended to the analysis prompt.")
-def analyze(path, provider, model, domain, fmt, instructions):
+@click.option("--whole-doc", is_flag=True,
+              help="Analyze all pages in ONE call so the model reasons across pages "
+                   "(connects a table on one page to a chart on another). Max 20 pages.")
+@click.option("--thinking-budget", default=None, type=int,
+              help="Extended-thinking tokens before the schema fill (Claude only). "
+                   "Default: engine's INTELLIGENCE_THINKING_BUDGET; 0 disables thinking.")
+def analyze(path, provider, model, domain, fmt, instructions, whole_doc, thinking_budget):
     """Interpret a document (tables, charts, diagrams) — structured, in-context.
 
     Unlike `read` (flat transcription), this extracts tables as data, interprets
     figures in context, and reports cross-content findings.
     """
-    from handwriting_engine.document_intelligence import analyze_document
+    from handwriting_engine.document_intelligence import analyze_document_set, analyze_pages
 
-    if path.lower().endswith(".pdf"):
-        import tempfile
-        from handwriting_engine.pdf import convert_pdf
-        tmpdir = tempfile.mkdtemp(prefix="hwe_analyze_")
-        _temp_dirs.append(tmpdir)
-        pages = convert_pdf(path, tmpdir)
-        image_paths = [(p.get("page_number", i + 1), p["path"]) for i, p in enumerate(pages)]
+    image_paths = _to_page_images(path)
+
+    kwargs = dict(
+        provider=provider, model=model, domain=domain,
+        extra_instructions=instructions, thinking_budget=thinking_budget,
+    )
+
+    if whole_doc:
+        analysis = analyze_document_set([img for _, img in image_paths], **kwargs)
+        analyses = [(0, analysis)]  # page 0 = whole document
     else:
-        image_paths = [(1, path)]
-
-    analyses = []
-    for page_no, img in image_paths:
-        analysis = analyze_document(
-            img, provider=provider, model=model, domain=domain, extra_instructions=instructions,
-        )
-        analyses.append((page_no, analysis))
+        results = analyze_pages([img for _, img in image_paths], **kwargs)
+        analyses = [(page_no, a) for (page_no, _), a in zip(image_paths, results)]
 
     if fmt == "json":
-        click.echo(json.dumps({
-            "path": path,
-            "domain": domain,
-            "provider": provider,
-            "pages": [{"page_number": n, **a.to_dict()} for n, a in analyses],
-        }, indent=2))
+        if whole_doc:
+            payload = {"path": path, "domain": domain, "provider": provider,
+                       "whole_doc": True, **analyses[0][1].to_dict()}
+        else:
+            payload = {"path": path, "domain": domain, "provider": provider,
+                       "pages": [{"page_number": n, **a.to_dict()} for n, a in analyses]}
+        click.echo(json.dumps(payload, indent=2))
         return
 
     for page_no, analysis in analyses:
         if len(analyses) > 1:
             click.echo(f"\n<!-- Page {page_no} -->\n")
         click.echo(analysis.to_markdown())
+
+
+@cli.command()
+@click.argument("path", type=click.Path(exists=True))
+@click.argument("question")
+@click.option("--provider", "-p", default="claude", type=click.Choice(["claude", "gemini", "openai"]),
+              help="Vision provider (claude recommended — richest schema support + Fable 5).")
+@click.option("--model", default=None, help="Model override (default: provider's intelligence tier, e.g. Fable 5).")
+@click.option("--domain", "-d", default="general", help="Domain hint folded into the prompt (e.g. biology).")
+@click.option("--format", "fmt", default="md", type=click.Choice(["md", "json"]),
+              help="Output shape: 'md' human report, 'json' structured payload.")
+@click.option("--thinking-budget", default=None, type=int,
+              help="Extended-thinking tokens before answering (Claude only). 0 disables thinking.")
+def ask(path, question, provider, model, domain, fmt, thinking_budget):
+    """Answer a QUESTION about a document, grounded in what's on the page(s).
+
+    A targeted read: instead of dumping the whole page as structured data (`analyze`),
+    it interprets charts/tables/handwriting in context and returns just the answer plus
+    the on-page evidence — far fewer output tokens. Multi-page PDFs are answered as a whole.
+    """
+    from handwriting_engine.document_intelligence import ask_document
+
+    image_paths = [img for _, img in _to_page_images(path)]
+    qa = ask_document(
+        image_paths, question, provider=provider, model=model,
+        domain=domain, thinking_budget=thinking_budget,
+    )
+
+    if fmt == "json":
+        click.echo(json.dumps(
+            {"path": path, "provider": provider, "domain": domain, **qa.to_dict()}, indent=2))
+        return
+    click.echo(qa.to_markdown())
 
 
 @cli.command()
