@@ -6,6 +6,7 @@ The root ``main.py`` imports from here for backwards compatibility.
 """
 
 import atexit
+import os
 import shutil
 import click
 import json
@@ -198,6 +199,50 @@ def read(path, provider, domain, prompt, writer, fmt):
             click.echo(p["text"])
 
 
+# Cloud providers and the env var each reads its key from.
+_PROVIDER_KEY_ENV = {
+    "claude": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "gemini": "GOOGLE_API_KEY",
+}
+# Substrings that betray a placeholder pasted verbatim instead of a real key.
+_PLACEHOLDER_MARKERS = ("your", "...", "real-key", "xxx", "changeme", "example", "<", "-here")
+
+
+def _preflight_api_key(provider):
+    """Fail fast with a one-line fix when the provider's key is missing or a placeholder.
+
+    Turns a 30-line 401 traceback (the most common first-run stumble) into a clear
+    ``ClickException`` — and skips a doomed API round-trip. Local providers (no entry
+    in the map) are exempt.
+    """
+    env = _PROVIDER_KEY_ENV.get(provider)
+    if not env:
+        return
+    val = os.getenv(env, "").strip()
+    if not val:
+        raise click.ClickException(
+            f"{env} is not set. Put your real key in a .env file (auto-loaded, gitignored):\n"
+            f"    echo '{env}=sk-...' > .env    # replace with your real key, then re-run"
+        )
+    if any(m in val.lower() for m in _PLACEHOLDER_MARKERS):
+        raise click.ClickException(
+            f"{env} looks like a placeholder ('{val[:16]}...'), not a real key:\n"
+            f"    echo '{env}=sk-...' > .env    # your real key, then re-run"
+        )
+
+
+def _friendly_provider_error(provider, exc) -> str:
+    """A terse, actionable message for a provider failure (no stack trace)."""
+    msg = str(exc)
+    low = msg.lower()
+    if "401" in msg or "authentication" in low or "invalid x-api-key" in low:
+        env = _PROVIDER_KEY_ENV.get(provider, "the API key")
+        return (f"{env} was rejected (401 — invalid key). Check it's valid and active:\n"
+                f"    echo '{env}=sk-...' > .env    # a working key, then re-run")
+    return msg
+
+
 def _to_page_images(path):
     """Page image paths for a file: [(1, path)] for an image, one per page for a PDF."""
     if path.lower().endswith(".pdf"):
@@ -232,7 +277,9 @@ def analyze(path, provider, model, domain, fmt, instructions, whole_doc, thinkin
     figures in context, and reports cross-content findings.
     """
     from handwriting_engine.document_intelligence import analyze_document_set, analyze_pages
+    from handwriting_engine.models import ProviderError
 
+    _preflight_api_key(provider)
     image_paths = _to_page_images(path)
 
     kwargs = dict(
@@ -240,12 +287,15 @@ def analyze(path, provider, model, domain, fmt, instructions, whole_doc, thinkin
         extra_instructions=instructions, thinking_budget=thinking_budget,
     )
 
-    if whole_doc:
-        analysis = analyze_document_set([img for _, img in image_paths], **kwargs)
-        analyses = [(0, analysis)]  # page 0 = whole document
-    else:
-        results = analyze_pages([img for _, img in image_paths], **kwargs)
-        analyses = [(page_no, a) for (page_no, _), a in zip(image_paths, results)]
+    try:
+        if whole_doc:
+            analysis = analyze_document_set([img for _, img in image_paths], **kwargs)
+            analyses = [(0, analysis)]  # page 0 = whole document
+        else:
+            results = analyze_pages([img for _, img in image_paths], **kwargs)
+            analyses = [(page_no, a) for (page_no, _), a in zip(image_paths, results)]
+    except ProviderError as e:
+        raise click.ClickException(_friendly_provider_error(provider, e))
 
     if fmt == "json":
         if whole_doc:
@@ -282,12 +332,17 @@ def ask(path, question, provider, model, domain, fmt, thinking_budget):
     the on-page evidence — far fewer output tokens. Multi-page PDFs are answered as a whole.
     """
     from handwriting_engine.document_intelligence import ask_document
+    from handwriting_engine.models import ProviderError
 
+    _preflight_api_key(provider)
     image_paths = [img for _, img in _to_page_images(path)]
-    qa = ask_document(
-        image_paths, question, provider=provider, model=model,
-        domain=domain, thinking_budget=thinking_budget,
-    )
+    try:
+        qa = ask_document(
+            image_paths, question, provider=provider, model=model,
+            domain=domain, thinking_budget=thinking_budget,
+        )
+    except ProviderError as e:
+        raise click.ClickException(_friendly_provider_error(provider, e))
 
     if fmt == "json":
         click.echo(json.dumps(
