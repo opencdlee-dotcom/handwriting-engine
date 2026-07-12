@@ -215,27 +215,55 @@ _PROVIDER_KEY_ENV = {
 _PLACEHOLDER_MARKERS = ("your", "...", "real-key", "xxx", "changeme", "example", "<", "-here")
 
 
+def _has_claude_oauth_credential() -> bool:
+    """True if an OAuth credential the anthropic SDK resolves on its own is present.
+
+    Covers the two documented non-API-key paths: the ``ANTHROPIC_AUTH_TOKEN``
+    Bearer env var, or an ``ant auth login`` profile on disk
+    (``$ANTHROPIC_CONFIG_DIR``/credentials/<profile>.json, default ~/.config/anthropic).
+    These still bill a metered API org — not a Max/Pro subscription.
+    """
+    if os.getenv("ANTHROPIC_AUTH_TOKEN", "").strip():
+        return True
+    cfg = os.getenv("ANTHROPIC_CONFIG_DIR") or os.path.expanduser("~/.config/anthropic")
+    try:
+        return any(f.endswith(".json") for f in os.listdir(os.path.join(cfg, "credentials")))
+    except OSError:
+        return False
+
+
 def _preflight_api_key(provider):
     """Fail fast with a one-line fix when the provider's key is missing or a placeholder.
 
     Turns a 30-line 401 traceback (the most common first-run stumble) into a clear
     ``ClickException`` — and skips a doomed API round-trip. Local providers (no entry
-    in the map) are exempt.
+    in the map) are exempt. For claude, an OAuth credential (``ANTHROPIC_AUTH_TOKEN``
+    or an ``ant auth login`` profile) also satisfies the check.
     """
     env = _PROVIDER_KEY_ENV.get(provider)
     if not env:
         return
     val = os.getenv(env, "").strip()
-    if not val:
+    if val:
+        if any(m in val.lower() for m in _PLACEHOLDER_MARKERS):
+            raise click.ClickException(
+                f"{env} looks like a placeholder ('{val[:16]}...'), not a real key:\n"
+                f"    echo '{env}=sk-...' > .env    # your real key, then re-run"
+            )
+        return
+    # No env key set. For claude, the SDK may still resolve an OAuth credential.
+    if provider == "claude" and _has_claude_oauth_credential():
+        return
+    if provider == "claude":
         raise click.ClickException(
-            f"{env} is not set. Put your real key in a .env file (auto-loaded, gitignored):\n"
-            f"    echo '{env}=sk-...' > .env    # replace with your real key, then re-run"
+            f"{env} is not set. Provide a metered key or an OAuth credential:\n"
+            f"    echo '{env}=sk-...' > .env    # metered API key (default), then re-run\n"
+            f"    # or: ant auth login          # OAuth profile the SDK picks up automatically"
         )
-    if any(m in val.lower() for m in _PLACEHOLDER_MARKERS):
-        raise click.ClickException(
-            f"{env} looks like a placeholder ('{val[:16]}...'), not a real key:\n"
-            f"    echo '{env}=sk-...' > .env    # your real key, then re-run"
-        )
+    raise click.ClickException(
+        f"{env} is not set. Put your real key in a .env file (auto-loaded, gitignored):\n"
+        f"    echo '{env}=sk-...' > .env    # replace with your real key, then re-run"
+    )
 
 
 def _friendly_provider_error(provider, exc) -> str:

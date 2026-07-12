@@ -44,11 +44,25 @@ class ClaudeProvider:
             raise ImportError("Install anthropic: pip install anthropic")
 
         self._api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
-        if not self._api_key:
-            raise ValueError("ANTHROPIC_API_KEY not set")
-
         self._model = model or os.getenv("CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL)
-        self._client = anthropic.Anthropic(api_key=self._api_key)
+
+        if self._api_key:
+            # Metered console API key — the x-api-key path, and the default.
+            self._client = anthropic.Anthropic(api_key=self._api_key)
+        else:
+            # No static key: let the SDK resolve an OAuth credential it reads on
+            # its own — ANTHROPIC_AUTH_TOKEN (Bearer) or an `ant auth login`
+            # profile on disk. A bare client picks these up. NOTE: this still
+            # authenticates a metered API org (billed per token); it is NOT a way
+            # to run on a Max/Pro subscription.
+            try:
+                self._client = anthropic.Anthropic()
+            except Exception as e:  # noqa: BLE001 — no resolvable credential
+                raise ValueError(
+                    "No Anthropic credentials found. Set ANTHROPIC_API_KEY, or "
+                    "set ANTHROPIC_AUTH_TOKEN / run `ant auth login` for OAuth."
+                ) from e
+
         self._usage = {"input_tokens": 0, "output_tokens": 0}
 
     def read_image(

@@ -29,9 +29,12 @@ def img_path():
 
 
 @pytest.fixture(autouse=True)
-def _clear_keys(monkeypatch):
-    for env in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY"):
+def _clear_keys(monkeypatch, tmp_path):
+    for env in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
         monkeypatch.delenv(env, raising=False)
+    # Point the OAuth-profile lookup at an empty dir so tests never see a real
+    # `ant auth login` on the host machine.
+    monkeypatch.setenv("ANTHROPIC_CONFIG_DIR", str(tmp_path / "no-anthropic-config"))
     yield
 
 
@@ -119,3 +122,36 @@ def test_batch_without_read_needs_no_key(runner, tmp_path):
     result = runner.invoke(cli, ["batch", str(img_dir)])
     assert "is not set" not in result.output
     assert "Assessed" in result.output
+
+
+# --- OAuth credential acceptance (claude only) --------------------------------
+
+def test_preflight_accepts_auth_token_for_claude(monkeypatch):
+    """ANTHROPIC_AUTH_TOKEN satisfies the claude preflight with no API key set."""
+    from handwriting_engine.cli import _preflight_api_key
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "sk-ant-oat01-xxx")
+    _preflight_api_key("claude")  # must not raise
+
+
+def test_preflight_accepts_ant_login_profile(monkeypatch, tmp_path):
+    """An `ant auth login` credentials profile on disk satisfies the check."""
+    from handwriting_engine.cli import _preflight_api_key
+    creds = tmp_path / "credentials"
+    creds.mkdir()
+    (creds / "default.json").write_text("{}")
+    monkeypatch.setenv("ANTHROPIC_CONFIG_DIR", str(tmp_path))
+    _preflight_api_key("claude")  # must not raise
+
+
+def test_preflight_no_credential_mentions_oauth(runner, img_path):
+    result = runner.invoke(cli, ["ask", img_path, "q?", "-p", "claude"])
+    assert result.exit_code != 0
+    assert "ant auth login" in result.output  # OAuth path surfaced
+
+
+def test_gemini_has_no_oauth_path(monkeypatch, tmp_path):
+    """The OAuth fallback is claude-only — gemini still hard-requires its key."""
+    from handwriting_engine.cli import _preflight_api_key
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "sk-ant-oat01-xxx")  # irrelevant to gemini
+    with pytest.raises(Exception, match="GOOGLE_API_KEY is not set"):
+        _preflight_api_key("gemini")

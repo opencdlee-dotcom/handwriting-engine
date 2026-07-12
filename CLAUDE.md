@@ -15,6 +15,7 @@ Consolidates ~3,000 lines from 8 locations into one reusable library.
 - **Writer identification**: `writer_embeddings.py` — Gemini multimodal embeddings for automatic writer clustering
 - **Batch API**: `providers/batch_openai.py` — 50% cost OpenAI batch processing for benchmarks
 - **Config**: `_constants.py` (defaults); the CLI autoloads a `.env` at startup via `python-dotenv` (non-override — an exported var still wins), so `ANTHROPIC_API_KEY` etc. need no manual `export`
+- **Claude auth**: metered `ANTHROPIC_API_KEY` (x-api-key) is the default. With no key, `ClaudeProvider` builds a bare `anthropic.Anthropic()` so the SDK resolves an OAuth credential — `ANTHROPIC_AUTH_TOKEN` (Bearer) or an `ant auth login` profile; the preflight accepts these too. This is still a metered API org (billed per token), NOT a Max/Pro-subscription bypass
 
 ## Key Design Decisions
 - **Multi-model consensus**: Gemini best overall (1.67% CER), Claude for layouts, GPT for disambiguation

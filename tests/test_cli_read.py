@@ -22,6 +22,14 @@ def runner():
     return CliRunner()
 
 
+@pytest.fixture(autouse=True)
+def _valid_api_key(monkeypatch):
+    """Give the claude-default `read` tests a non-placeholder key so the CLI
+    preflight passes deterministically, independent of the developer's ambient
+    .env. The vision layer is mocked, so no real call is made."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-testkeyvalid0123456789")
+
+
 def _fake_consensus(*args, **kwargs):
     return ConsensusResult(
         text="The mitochondria [?alt: mitochondrion] is the powerhouse [?alt: power-house]",
