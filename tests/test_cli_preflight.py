@@ -74,3 +74,48 @@ def test_friendly_error_maps_401_to_key_hint():
     msg = _friendly_provider_error("claude", Exception("Error code: 401 - invalid x-api-key"))
     assert "ANTHROPIC_API_KEY was rejected" in msg
     assert "Traceback" not in msg
+
+
+# --- read (primary command) ---------------------------------------------------
+
+def test_read_missing_key_is_clean_error(runner, img_path):
+    result = runner.invoke(cli, ["read", img_path, "-p", "claude"])
+    assert result.exit_code != 0
+    assert "ANTHROPIC_API_KEY is not set" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_read_placeholder_key_is_clean_error(runner, img_path, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-changeme")
+    result = runner.invoke(cli, ["read", img_path, "-p", "claude"])
+    assert result.exit_code != 0
+    assert "placeholder" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_preflight_noop_for_consensus():
+    """Consensus is multi-provider — preflight must not block it on one key."""
+    from handwriting_engine.cli import _preflight_api_key
+    _preflight_api_key("consensus")  # must not raise
+
+
+# --- batch --read -------------------------------------------------------------
+
+def test_batch_read_missing_key_is_clean_error(runner, tmp_path):
+    img_dir = tmp_path / "imgs"
+    img_dir.mkdir()
+    Image.new("RGB", (64, 64), (128, 128, 128)).save(img_dir / "a.jpg", "JPEG")
+    result = runner.invoke(cli, ["batch", str(img_dir), "--read", "-p", "claude"])
+    assert result.exit_code != 0
+    assert "ANTHROPIC_API_KEY is not set" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_batch_without_read_needs_no_key(runner, tmp_path):
+    """No --read => local-only assessment, no key required (preflight must not fire)."""
+    img_dir = tmp_path / "imgs"
+    img_dir.mkdir()
+    Image.new("RGB", (64, 64), (128, 128, 128)).save(img_dir / "a.jpg", "JPEG")
+    result = runner.invoke(cli, ["batch", str(img_dir)])
+    assert "is not set" not in result.output
+    assert "Assessed" in result.output

@@ -121,6 +121,9 @@ def _extract_alt_markers(text: str) -> list[dict]:
               help="Output shape. 'json' emits a structured payload with extracted alt-markers — used by the handwriting-reader skill.")
 def read(path, provider, domain, prompt, writer, fmt):
     """Read handwritten text from image or PDF."""
+    from handwriting_engine.models import ProviderError
+
+    _preflight_api_key(provider)  # no-op for the multi-provider 'consensus' path
     if path.lower().endswith(".pdf"):
         import tempfile
         from handwriting_engine.pdf import convert_pdf
@@ -132,39 +135,42 @@ def read(path, provider, domain, prompt, writer, fmt):
         image_paths = [(1, path)]
 
     page_payloads = []
-    for page_no, img in image_paths:
-        if provider == "consensus":
-            from handwriting_engine import vision as _vision
-            result = _vision.read_with_consensus(img, prompt=prompt, domain=domain, writer_id=writer)
-            page_payloads.append({
-                "page_number": page_no,
-                "image_path": img,
-                "text": result.text,
-                "provider": "consensus",
-                "confidence": result.confidence,
-                "confidence_level": result.confidence_level,
-                "strategy_used": result.strategy_used,
-                "disagreements": list(result.disagreements),
-                "alt_markers": _extract_alt_markers(result.text),
-                "provider_results": dict(result.provider_results),
-                "tokens_used": dict(result.tokens_used),
-            })
-        else:
-            from handwriting_engine import vision as _vision
-            text = _vision.read_page(img, prompt=prompt, domain=domain, provider=provider)
-            page_payloads.append({
-                "page_number": page_no,
-                "image_path": img,
-                "text": text,
-                "provider": provider,
-                "confidence": None,
-                "confidence_level": None,
-                "strategy_used": None,
-                "disagreements": [],
-                "alt_markers": _extract_alt_markers(text),
-                "provider_results": {provider: text},
-                "tokens_used": {},
-            })
+    try:
+        for page_no, img in image_paths:
+            if provider == "consensus":
+                from handwriting_engine import vision as _vision
+                result = _vision.read_with_consensus(img, prompt=prompt, domain=domain, writer_id=writer)
+                page_payloads.append({
+                    "page_number": page_no,
+                    "image_path": img,
+                    "text": result.text,
+                    "provider": "consensus",
+                    "confidence": result.confidence,
+                    "confidence_level": result.confidence_level,
+                    "strategy_used": result.strategy_used,
+                    "disagreements": list(result.disagreements),
+                    "alt_markers": _extract_alt_markers(result.text),
+                    "provider_results": dict(result.provider_results),
+                    "tokens_used": dict(result.tokens_used),
+                })
+            else:
+                from handwriting_engine import vision as _vision
+                text = _vision.read_page(img, prompt=prompt, domain=domain, provider=provider)
+                page_payloads.append({
+                    "page_number": page_no,
+                    "image_path": img,
+                    "text": text,
+                    "provider": provider,
+                    "confidence": None,
+                    "confidence_level": None,
+                    "strategy_used": None,
+                    "disagreements": [],
+                    "alt_markers": _extract_alt_markers(text),
+                    "provider_results": {provider: text},
+                    "tokens_used": {},
+                })
+    except ProviderError as e:
+        raise click.ClickException(_friendly_provider_error(provider, e))
 
     if fmt == "json":
         click.echo(json.dumps({
@@ -388,6 +394,7 @@ def batch_cmd(directory, do_enhance, strategy, do_read, provider):
                 click.echo(f"  Enhanced: {os.path.basename(img_path)}")
 
     if do_read:
+        _preflight_api_key(provider)
         from handwriting_engine.vision import read_page
         for img_path in results:
             text = read_page(img_path, provider=provider)
