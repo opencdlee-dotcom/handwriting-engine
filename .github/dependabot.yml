@@ -1,0 +1,39 @@
+# Dependency updates arrive as pull requests that the suite above has already run
+# against -- the whole point of adding CI first. Before this file the only signal was
+# the Alerts tab, which cannot open a PR, cannot run a test, and cannot be closed by
+# anything except a push that a human remembered to make.
+version: 2
+updates:
+  # uv.lock on the default branch.
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      # One PR, one CI run, one review. Twenty-five separate PRs is how the last batch
+      # of advisories became something nobody worked through.
+      python-dependencies:
+        patterns: ["*"]
+
+  # The training branch carries its own uv.lock (torch, transformers, CUDA wheels) and
+  # is where every one of the 25 alerts of 2026-08-05 actually lived -- the default
+  # branch had no lockfile at all. Dependabot only opens SECURITY PRs against the
+  # default branch, so this entry keeps the branch current by version updates instead.
+  - package-ecosystem: "uv"
+    directory: "/"
+    target-branch: "feat/trained-corrector"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      python-dependencies:
+        patterns: ["*"]
+
+  # The workflow above pins its actions by commit SHA, which is the safe way to depend
+  # on someone else's code and also the way that silently goes stale. This keeps the
+  # pins moving.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
