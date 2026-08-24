@@ -163,7 +163,7 @@ Defer:
 ## Sources
 
 - Codebase inspection: `handwriting_engine/benchmark/` (metrics.py, report.py, evaluate.py, db.py, ingest.py, models.py) — HIGH confidence
-- `/Users/user/Documents/Work & Projects/VSCode Projects/handwriting-engine/.planning/PROJECT.md` — HIGH confidence
+- `~/Developer/handwriting-engine/.planning/PROJECT.md` — HIGH confidence
 - `.planning/research/brainiac-htr-sota.md` — MEDIUM confidence (PaddleOCR IAM CER ~5.8% is from pre-v3.0 research, not yet measured against PP-OCRv5 specifically)
 - `.planning/milestones/v2.0-MILESTONE-AUDIT.md` — HIGH confidence (tech debt items confirmed)
 - IAM dataset evaluation protocol: consistent with published TrOCR / DTrOCR benchmarks using IAM lines split — MEDIUM confidence (standard practice, but exact split selection needs to be confirmed against the IAM paper splits when downloading)

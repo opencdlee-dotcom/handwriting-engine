@@ -1,0 +1,20 @@
+# .leakgate-allow — adjudicated false positives for this repo. One Python regex per line;
+# a finding whose matched TEXT or whose `path:line` matches an entry is dropped.
+#
+# Narrow entries only. Never a `rule:` line here: this repo's content is ordinary source,
+# so a whole class switched off would hide the next real one.
+
+# /Users/user — the generic placeholder this project's planning docs and .mcp.json examples
+# use for "the reader's home directory". leakgate's posix-home-path rule fires on the SHAPE
+# of a POSIX home path, which is right: a real /Users/<name> in a public repo names a person
+# and a machine. This one names nobody.
+#
+# Measured 2026-08-24 on the Ryzen's 53 unpushed commits: 57 findings, 100% of them this
+# exact string (`git grep -oE '/Users/[A-Za-z0-9._-]+' | sort | uniq -c` -> `57 /Users/user`,
+# and zero hits for the real account names). Without this line the gate blocks that push
+# entirely, and a gate that blocks a clean push is a gate someone runs with LEAKGATE_SKIP=1 —
+# which is how the next genuine finding gets waved through too.
+#
+# Deliberately anchored to this one placeholder: /Users/<anything else> still blocks.
+^/Users/user(/|$|["'\s])
+/Users/user/
