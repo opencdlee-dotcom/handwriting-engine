@@ -45,6 +45,166 @@ PROVIDER_WEIGHTS = {
 # Cascade order: cheapest first (~$0.0005/img → ~$0.003 → ~$0.005)
 CASCADE_ORDER = ["gemini", "openai", "claude"]
 
+# ---------------------------------------------------------------------------
+# Char-level confusion-pair resolution (S5)
+# ---------------------------------------------------------------------------
+#
+# Each tuple is (alt_form, canonical_form). When two providers disagree on a
+# word and the only char-level differences match one of these pairs, we
+# resolve to the canonical form by default. A writer profile entry of the
+# form `confusion_resolutions["<a>↔<b>"] = "<a>" or "<b>"` overrides per writer.
+#
+# Pairs without a clear canonical winner (b↔d, p↔q, i↔j) are intentionally
+# omitted — without context, defaulting either way introduces error. They
+# defer to the existing [?alt: …] fallback.
+_CHAR_CONFUSION_PAIRS: list[tuple[str, str]] = [
+    # Multi-char ↔ single-char (the dominant residual error class)
+    ("rn", "m"),
+    ("cl", "d"),
+    ("ri", "n"),
+    ("uu", "w"),
+    # Single-char letter pairs with a canonical form
+    ("u", "v"),
+    ("a", "o"),
+    ("n", "h"),
+    ("e", "c"),
+    ("f", "t"),
+    ("q", "g"),
+    # Case-sensitive letter/digit pairs (canonical = letter form for in-word context)
+    ("0", "O"),
+    ("1", "l"),
+    ("1", "I"),
+    ("I", "l"),
+    ("5", "S"),
+    ("2", "Z"),
+    ("6", "G"),
+    ("8", "B"),
+]
+
+
+def _confusion_pair_label(a: str, b: str) -> str:
+    """Canonical pair-name string used as writer_resolutions dict key."""
+    return f"{a}↔{b}"
+
+
+def _match_confusion_pair(left: str, right: str) -> tuple[str, str] | None:
+    """Return the canonical (alt, canonical) pair tuple if (left, right) match
+    one of the known confusion pairs in either order; else None.
+
+    Whole-segment match (e.g. ``("rn", "m")``) is checked first so multi-char
+    pairs win over the per-char fallback below.
+    """
+    for alt, canon in _CHAR_CONFUSION_PAIRS:
+        if (left, right) == (alt, canon) or (left, right) == (canon, alt):
+            return (alt, canon)
+    return None
+
+
+def _decompose_diff_into_pairs(
+    seg_a: str, seg_b: str
+) -> list[tuple[str, str]] | None:
+    """Try to express the (seg_a, seg_b) diff as a sequence of per-position
+    confusion-pair swaps.
+
+    Returns a list of (left_char, right_char) sub-pairs, or None if the diff
+    isn't decomposable into known confusion pairs.
+
+    Whole-segment match wins (so ``("ll", "II")`` is decomposed into two
+    `("l", "I")` pairs only because no entry like ``("ll", "II")`` exists).
+    """
+    direct = _match_confusion_pair(seg_a, seg_b)
+    if direct is not None:
+        return [(seg_a, seg_b)]
+
+    # Per-character fallback only works for equal-length segments.
+    if len(seg_a) != len(seg_b):
+        return None
+    parts: list[tuple[str, str]] = []
+    for ca, cb in zip(seg_a, seg_b):
+        if ca == cb:
+            parts.append((ca, cb))
+            continue
+        if _match_confusion_pair(ca, cb) is None:
+            return None
+        parts.append((ca, cb))
+    return parts
+
+
+def resolve_char_level(
+    candidates: list[str],
+    weights: list[float] | None = None,
+    *,
+    writer_resolutions: dict[str, str] | None = None,
+) -> str | None:
+    """Resolve a no-majority word-level disagreement at character level.
+
+    When two candidates differ only by known confusion-pair substrings
+    (`rn↔m`, `cl↔d`, `0↔O`, …), pick the resolution. The writer profile's
+    `confusion_resolutions` map (if provided) overrides the global canonical
+    default per pair.
+
+    Returns the resolved word, or `None` when the disagreement is not a
+    pure confusion-pair case — caller must fall back to its existing
+    no-majority handling (e.g. `[?alt: …]`).
+
+    v0 scope: handles 1-2 unique candidates. With 3+ distinct candidates,
+    returns None (defer to existing fallback).
+    """
+    if not candidates:
+        return None
+
+    unique = list(dict.fromkeys(candidates))  # preserve first-seen order
+    if len(unique) == 1:
+        return unique[0]
+    if len(unique) > 2:
+        return None
+
+    a, b = unique[0], unique[1]
+    matcher = SequenceMatcher(None, a, b)
+    opcodes = matcher.get_opcodes()
+
+    # All differing segments must decompose into known confusion-pair swaps.
+    decomposed: list[tuple[str, list[tuple[str, str]]]] = []
+    has_diff = False
+    for tag, i1, i2, j1, j2 in opcodes:
+        if tag == "equal":
+            decomposed.append(("equal", [(a[i1:i2], a[i1:i2])]))
+            continue
+        has_diff = True
+        seg_a = a[i1:i2]
+        seg_b = b[j1:j2]
+        parts = _decompose_diff_into_pairs(seg_a, seg_b)
+        if parts is None:
+            return None
+        decomposed.append(("diff", parts))
+
+    if not has_diff:
+        return a
+
+    writer_resolutions = writer_resolutions or {}
+
+    out_chars: list[str] = []
+    for tag, parts in decomposed:
+        if tag == "equal":
+            out_chars.append(parts[0][0])
+            continue
+        for left, right in parts:
+            if left == right:
+                out_chars.append(left)
+                continue
+            pair = _match_confusion_pair(left, right)
+            if pair is None:
+                return None
+            alt, canon = pair
+            label = _confusion_pair_label(alt, canon)
+            choice = writer_resolutions.get(label)
+            if choice in (alt, canon):
+                out_chars.append(choice)
+            else:
+                out_chars.append(canon)
+
+    return "".join(out_chars)
+
 # Uncertainty marker pattern — must be defined here (before _self_correct and confidence helpers)
 _UNCERTAINTY_RE = re.compile(
     r"\[\?\]|\?\?\?|\[illegible[^\]]*\]|\[unclear\]|unable to read",
@@ -75,6 +235,7 @@ def read_with_consensus(
     quality_assessment: dict | None = None,
     max_self_correct_rounds: int = 1,
     uncertainty_threshold: int = 3,
+    writer_profile: dict | None = None,
 ) -> ConsensusResult:
     """
     Read an image using multiple models and combine results.
@@ -98,7 +259,7 @@ def read_with_consensus(
     if strategy == "best_of":
         return _best_of(image_b64, media_type, prompt, system_prompt, content_type, max_tokens)
     elif strategy == "vote":
-        return _vote(image_b64, media_type, prompt, system_prompt, providers, confidence_threshold, content_type, max_tokens)
+        return _vote(image_b64, media_type, prompt, system_prompt, providers, confidence_threshold, content_type, max_tokens, writer_profile=writer_profile)
     elif strategy == "debate":
         return _debate(image_b64, media_type, prompt, system_prompt, providers, max_tokens, max_debate_rounds)
     elif strategy == "cascade":
@@ -108,8 +269,8 @@ def read_with_consensus(
     elif strategy == "smart":
         if quality_assessment is None:
             # No quality data — fall back to vote
-            return _vote(image_b64, media_type, prompt, system_prompt, providers, confidence_threshold, content_type, max_tokens)
-        return _smart_route(image_b64, media_type, prompt, system_prompt, quality_assessment, content_type, max_tokens, uncertainty_threshold)
+            return _vote(image_b64, media_type, prompt, system_prompt, providers, confidence_threshold, content_type, max_tokens, writer_profile=writer_profile)
+        return _smart_route(image_b64, media_type, prompt, system_prompt, quality_assessment, content_type, max_tokens, uncertainty_threshold, writer_profile=writer_profile)
     else:
         raise ValueError(f"Unknown strategy: {strategy}. Use: vote, best_of, debate, cascade, smart, self_correct")
 
@@ -258,6 +419,7 @@ def _vote(
     image_b64: str, media_type: str, prompt: str, system_prompt: str,
     providers: list[str] | None, confidence_threshold: float,
     content_type: str = "default", max_tokens: int = 4096,
+    *, writer_profile: dict | None = None,
 ) -> ConsensusResult:
     """Send to N providers, word-level majority vote.
 
@@ -404,7 +566,7 @@ def _vote(
         provider_weights.append((name, base_weight * confidence_scale))
 
     best_text, disagreements, confidence = _word_level_vote(
-        texts, provider_weights,
+        texts, provider_weights, writer_profile=writer_profile,
     )
 
     if excluded:
@@ -735,6 +897,7 @@ def _smart_route(
     image_b64: str, media_type: str, prompt: str, system_prompt: str,
     quality_assessment: dict, content_type: str, max_tokens: int,
     uncertainty_threshold: int = 3,
+    *, writer_profile: dict | None = None,
 ) -> ConsensusResult:
     """Adaptive routing based on image quality — spend API calls where they matter.
 
@@ -794,7 +957,7 @@ def _smart_route(
 
     else:
         # Hard: full vote with all available providers
-        return _vote(image_b64, media_type, prompt, system_prompt, None, 0.8, content_type, max_tokens)
+        return _vote(image_b64, media_type, prompt, system_prompt, None, 0.8, content_type, max_tokens, writer_profile=writer_profile)
 
 
 # ---------------------------------------------------------------------------
@@ -945,17 +1108,22 @@ def _word_agreement_ratio(text_a: str, text_b: str) -> float:
 def _word_level_vote(
     texts: list[str],
     provider_weights: list[tuple[str, float]],
+    writer_profile: dict | None = None,
 ) -> tuple[str, list[str], float]:
     """Word-level majority vote across N provider outputs.
 
     For each word position:
     - If all providers agree → keep the word
     - If majority agrees → keep majority, record disagreement
-    - If no majority → keep highest-weighted provider's word, mark with [?alt: ...]
+    - If no majority → try char-level confusion-pair resolution (S5);
+      if that defers, keep highest-weighted provider's word, mark with [?alt: ...]
 
     Returns (final_text, disagreements, confidence).
     Confidence = fraction of word positions where providers agreed.
     """
+    writer_resolutions = (
+        (writer_profile or {}).get("confusion_resolutions") or {}
+    )
     all_words = [_tokenize_preserving_newlines(t) for t in texts]
 
     # Use highest-weighted provider as alignment anchor
@@ -1047,13 +1215,25 @@ def _word_level_vote(
                 if winner != "\n" and runner_up != "\n":
                     disagreements.append(f"'{runner_up}' vs '{winner}' (majority)")
             else:
-                # No majority — use highest-weighted provider, mark ambiguous
-                result_words.append(winner)
-                alts = [w for w, _ in sorted_votes[1:] if w != "\n"]
-                if alts and winner != "\n":
-                    alt_str = "/".join(alts[:2])
-                    result_words.append(f"[?alt: {alt_str}]")
-                    disagreements.append(f"'{winner}' vs '{alt_str}' (no majority)")
+                # No majority — try char-level confusion-pair resolution
+                # before falling back to the [?alt: …] marker.
+                candidates = [w for w, _ in sorted_votes if w != "\n"]
+                weights = [v for w, v in sorted_votes if w != "\n"]
+                resolved = resolve_char_level(
+                    candidates,
+                    weights,
+                    writer_resolutions=writer_resolutions,
+                )
+                if resolved is not None:
+                    result_words.append(resolved)
+                else:
+                    # No clean confusion-pair match — emit ambiguous marker.
+                    result_words.append(winner)
+                    alts = [w for w, _ in sorted_votes[1:] if w != "\n"]
+                    if alts and winner != "\n":
+                        alt_str = "/".join(alts[:2])
+                        result_words.append(f"[?alt: {alt_str}]")
+                        disagreements.append(f"'{winner}' vs '{alt_str}' (no majority)")
 
     # Reconstruct text from tokens
     final_parts = []

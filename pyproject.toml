@@ -25,6 +25,13 @@ openai = ["openai>=1.50.0"]
 gemini = ["google-genai>=1.0.0"]
 all = ["anthropic>=0.40.0", "openai>=1.50.0", "google-genai>=1.0.0"]
 benchmark = ["jiwer>=3.0.0", "numpy>=1.24.0"]
+trained-correction = [
+    "torch>=2.4.0",
+    "transformers>=4.45.0",
+    "sentencepiece>=0.2.0",
+    "accelerate>=0.34.0",
+    "numpy>=1.24.0",
+]
 dev = ["pytest>=8.0.0"]
 
 [project.scripts]

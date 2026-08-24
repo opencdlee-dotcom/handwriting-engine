@@ -263,7 +263,7 @@
                 # Only called once (best_of, no escalation)
                 assert mock.read_image.call_count == 1
       </action>
-      <verify>cd "~/Developer/handwriting-engine" && python -m pytest tests/test_consensus.py -x -q 2>&1 | tail -5</verify>
+      <verify>cd "/Users/user/Documents/VSCode Projects/handwriting-engine" && python -m pytest tests/test_consensus.py -x -q 2>&1 | tail -5</verify>
       <done>All consensus tests pass including new TestSelfCorrectStrategy and TestSmartEscalation</done>
     </task>
   </tasks>

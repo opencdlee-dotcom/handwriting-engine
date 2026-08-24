@@ -244,3 +244,86 @@ class TestEditDistance1Helper:
     def test_length_diff_two_rejected(self):
         from handwriting_engine.postprocess import _within_edit_distance_1
         assert not _within_edit_distance_1("ce", "cell")
+
+
+class TestConfusionPairPostprocess:
+    """S5 falsifiable criteria #4-5, #8 — confusion-pair-aware postprocess."""
+
+    def test_corrects_celI_to_cell(self):
+        # Criterion #4: "celI" (uppercase I) → "cell" via I↔l swap.
+        from handwriting_engine.postprocess import correct_confusion_pairs
+        text, corrections = correct_confusion_pairs(
+            "the celI underwent mitosis", domain="biology"
+        )
+        assert "cell" in text
+        assert "celI" not in text
+        assert any(c.original == "celI" and c.corrected == "cell" for c in corrections)
+
+    def test_does_not_overcorrect_clean_text(self):
+        # Criterion #5: input has no domain-relevant confusion-pair candidates;
+        # output is bit-identical.
+        from handwriting_engine.postprocess import correct_confusion_pairs
+        text, corrections = correct_confusion_pairs(
+            "the apple is red", domain="biology"
+        )
+        assert text == "the apple is red"
+        assert corrections == []
+
+    def test_audit_log_records_pair_name(self):
+        # Criterion #8: each correction has original, corrected, AND the
+        # pair name so silent over-correction is detectable.
+        from handwriting_engine.postprocess import correct_confusion_pairs
+        _, corrections = correct_confusion_pairs(
+            "the celI is alive", domain="biology"
+        )
+        assert len(corrections) >= 1
+        assert corrections[0].pair  # pair label is present
+
+    def test_skips_when_no_unique_match(self):
+        # Multiple pair-swap candidates land in wordlist → don't pick one.
+        # (If both "cell" and "ceil" were in wordlist, "ceII" → ambiguous.)
+        # Construct a benign no-match: "xyz" has no confusion-pair swap to a
+        # known biology term.
+        from handwriting_engine.postprocess import correct_confusion_pairs
+        text, corrections = correct_confusion_pairs(
+            "xyzqrstuv passed through", domain="biology"
+        )
+        # "xyzqrstuv" is gibberish — no swap fixes it; passes through unchanged.
+        assert "xyzqrstuv" in text
+
+    def test_correct_pipeline_runs_confusion_pass_when_enabled(self, monkeypatch):
+        # Default ON: HE_CONFUSION_POSTPROCESS=1 (or unset).
+        from handwriting_engine import postprocess as pp
+        monkeypatch.delenv("HE_CONFUSION_POSTPROCESS", raising=False)
+        out = pp.correct("the celI underwent mitosis", domain="biology")
+        assert "cell" in out
+
+    def test_correct_pipeline_skips_when_disabled(self, monkeypatch):
+        # HE_CONFUSION_POSTPROCESS=0 disables the new pass; the heuristic
+        # ED1 pass must NOT pick up "celI" because of the short-word guard
+        # at len < 6 (and because "celI" lowercases to "celi" which isn't
+        # within ED1 of any single biology term insertion-only).
+        from handwriting_engine import postprocess as pp
+        monkeypatch.setenv("HE_CONFUSION_POSTPROCESS", "0")
+        out = pp.correct("the celI underwent mitosis", domain="biology")
+        # Confusion pass off → "celI" survives unchanged.
+        assert "celI" in out
+
+    def test_pair_correction_preserves_capitalization(self):
+        # Capital first letter must survive the swap.
+        from handwriting_engine.postprocess import correct_confusion_pairs
+        text, _ = correct_confusion_pairs("CelI grew quickly", domain="biology")
+        # First letter capital preserved, "I" → "l" applied.
+        assert "Cell" in text
+
+    def test_writer_id_signature_accepted(self):
+        # Public signature accepts writer_id and db_path even when they no-op
+        # (graceful with no DB) so callers can be wired today.
+        from handwriting_engine.postprocess import correct_confusion_pairs
+        text, _ = correct_confusion_pairs(
+            "the celI underwent mitosis",
+            domain="biology",
+            writer_id="alice",
+            db_path=None,
+        )
+        assert "cell" in text

@@ -12,7 +12,7 @@
     <task type="auto">
       <name>Create handwriting_engine/postprocess.py with domain spell correction</name>
       <action>
-Create ~/Developer/handwriting-engine/handwriting_engine/postprocess.py:
+Create /Users/user/Documents/VSCode Projects/handwriting-engine/handwriting_engine/postprocess.py:
 
 """
 Domain-specific spell correction for handwriting transcription output.
@@ -188,7 +188,7 @@ def correct_domain_terms(text: str, domain: str = "biology") -> str:
     <task type="auto">
       <name>Wire domain correction into vision.py _postprocess_output()</name>
       <action>
-In ~/Developer/handwriting-engine/handwriting_engine/vision.py:
+In /Users/user/Documents/VSCode Projects/handwriting-engine/handwriting_engine/vision.py:
 
 1. Find the _postprocess_output() function and add an optional domain parameter:
    def _postprocess_output(text: str, domain: str | None = None) -> str:
@@ -212,7 +212,7 @@ In ~/Developer/handwriting-engine/handwriting_engine/vision.py:
     <task type="auto">
       <name>Create tests/test_postprocess.py</name>
       <action>
-Create ~/Developer/handwriting-engine/tests/test_postprocess.py (or append if it exists):
+Create /Users/user/Documents/VSCode Projects/handwriting-engine/tests/test_postprocess.py (or append if it exists):
 
 """Tests for domain spell correction."""
 from handwriting_engine.postprocess import correct_domain_terms, _edit_distance_1_candidates, _BIOLOGY_TERMS
@@ -273,7 +273,7 @@ def test_empty_string():
     <task type="auto">
       <name>Add --compare-strategies flag to benchmark CLI and regression alerting</name>
       <action>
-In ~/Developer/handwriting-engine/handwriting_engine/benchmark/evaluate.py:
+In /Users/user/Documents/VSCode Projects/handwriting-engine/handwriting_engine/benchmark/evaluate.py:
 
 Read the file first to understand the existing CLI structure. Then:
 

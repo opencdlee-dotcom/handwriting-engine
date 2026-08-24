@@ -12,7 +12,7 @@
     <task type="auto">
       <name>Create handwriting_engine/providers/paddleocr_provider.py</name>
       <action>
-Create ~/Developer/handwriting-engine/handwriting_engine/providers/paddleocr_provider.py:
+Create /Users/user/Documents/VSCode Projects/handwriting-engine/handwriting_engine/providers/paddleocr_provider.py:
 
 """
 PaddleOCR 3.0 (PP-OCRv5) vision provider.
@@ -143,7 +143,7 @@ register("paddleocr", PaddleOCRProvider)
     <task type="auto">
       <name>Create handwriting_engine/providers/trocr_provider.py</name>
       <action>
-Create ~/Developer/handwriting-engine/handwriting_engine/providers/trocr_provider.py:
+Create /Users/user/Documents/VSCode Projects/handwriting-engine/handwriting_engine/providers/trocr_provider.py:
 
 """
 TrOCR vision provider using HuggingFace transformers.
@@ -319,7 +319,7 @@ register("trocr", TrOCRProvider)
     <task type="auto">
       <name>Register new providers in providers/__init__.py and add tests</name>
       <action>
-1. In ~/Developer/handwriting-engine/handwriting_engine/providers/__init__.py:
+1. In /Users/user/Documents/VSCode Projects/handwriting-engine/handwriting_engine/providers/__init__.py:
 
 In the _try_autoload() function, add two new elif branches:
         elif name == "paddleocr":
@@ -331,7 +331,7 @@ Also update the available_providers() function — the autoload loop currently o
     for name in ("claude", "openai", "gemini", "paddleocr", "trocr"):
         _try_autoload(name)
 
-2. Create ~/Developer/handwriting-engine/tests/test_providers_new.py:
+2. Create /Users/user/Documents/VSCode Projects/handwriting-engine/tests/test_providers_new.py:
 
 """Tests for PaddleOCR and TrOCR providers — availability and interface."""
 import base64
@@ -402,7 +402,7 @@ class TestTrOCRProvider:
         with pytest.raises(ValueError, match="same length"):
             provider.fine_tune_for_writer("test_writer", ["b64img"], ["text1", "text2"])
       </action>
-      <verify>cd "~/Developer/handwriting-engine" && python -m pytest tests/test_providers_new.py -x -q 2>&1 | tail -10</verify>
+      <verify>cd "/Users/user/Documents/VSCode Projects/handwriting-engine" && python -m pytest tests/test_providers_new.py -x -q 2>&1 | tail -10</verify>
       <done>New provider tests pass; paddleocr and trocr in _REGISTRY after import</done>
     </task>
   </tasks>

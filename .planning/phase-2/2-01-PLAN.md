@@ -11,7 +11,7 @@
     <task type="auto">
       <name>Create handwriting_engine/line_reader.py</name>
       <action>
-Create ~/Developer/handwriting-engine/handwriting_engine/line_reader.py:
+Create /Users/user/Documents/VSCode Projects/handwriting-engine/handwriting_engine/line_reader.py:
 
 """
 Line-level segmentation for handwritten page images.
@@ -171,7 +171,7 @@ def read_page_by_lines(
     <task type="auto">
       <name>Add line_level parameter to vision.py read_image()</name>
       <action>
-In ~/Developer/handwriting-engine/handwriting_engine/vision.py, find the main read_image() function (it will have image_path, prompt, etc. as parameters).
+In /Users/user/Documents/VSCode Projects/handwriting-engine/handwriting_engine/vision.py, find the main read_image() function (it will have image_path, prompt, etc. as parameters).
 
 Add a `line_level: bool = False` parameter to the function signature.
 
@@ -197,7 +197,7 @@ This should be inserted early in read_image(), after image loading/enhancement b
     <task type="auto">
       <name>Create tests/test_line_reader.py</name>
       <action>
-Create ~/Developer/handwriting-engine/tests/test_line_reader.py:
+Create /Users/user/Documents/VSCode Projects/handwriting-engine/tests/test_line_reader.py:
 
 """Tests for line-level segmentation."""
 import io
@@ -296,7 +296,7 @@ def test_read_page_by_lines_assembles_in_order(tmp_path):
     assert parts[0] == "line_1"
     assert parts[-1] == f"line_{call_count[0]}"
       </action>
-      <verify>cd "~/Developer/handwriting-engine" && python -m pytest tests/test_line_reader.py -x -q 2>&1 | tail -5</verify>
+      <verify>cd "/Users/user/Documents/VSCode Projects/handwriting-engine" && python -m pytest tests/test_line_reader.py -x -q 2>&1 | tail -5</verify>
       <done>All line_reader tests pass</done>
     </task>
   </tasks>

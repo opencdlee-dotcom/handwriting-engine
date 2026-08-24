@@ -20,7 +20,7 @@ from handwriting_engine.benchmark.models import (
 )
 
 DEFAULT_DB_PATH = Path.home() / ".handwriting-engine" / "benchmark.db"
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 6
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +73,8 @@ CREATE TABLE IF NOT EXISTS runs (
     model_version    TEXT DEFAULT NULL,
     iam_partition    TEXT DEFAULT NULL,
     norm_flags       TEXT DEFAULT NULL,
-    vocab_hints_off  INTEGER DEFAULT 0
+    vocab_hints_off  INTEGER DEFAULT 0,
+    is_baseline      INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS provider_outputs (
@@ -108,6 +109,17 @@ CREATE TABLE IF NOT EXISTS eval_metrics (
 );
 CREATE INDEX IF NOT EXISTS idx_em_output ON eval_metrics(provider_output_id);
 
+CREATE TABLE IF NOT EXISTS corrections (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_id       INTEGER NOT NULL REFERENCES samples(id),
+    ground_truth_id INTEGER NOT NULL REFERENCES ground_truths(id),
+    original_text   TEXT NOT NULL,
+    confidence      REAL,
+    source          TEXT NOT NULL,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_corrections_sample ON corrections(sample_id);
+
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER PRIMARY KEY
 );
@@ -136,6 +148,25 @@ _MIGRATIONS: dict[int, str] = {
         ALTER TABLE runs ADD COLUMN vocab_hints_off INTEGER DEFAULT 0;
         ALTER TABLE provider_outputs ADD COLUMN question_marker_rate REAL DEFAULT NULL;
         UPDATE schema_version SET version = 4;
+    """,
+    # v5: Add corrections table for instructor-corrected transcriptions (S4)
+    5: """
+        CREATE TABLE IF NOT EXISTS corrections (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            sample_id       INTEGER NOT NULL REFERENCES samples(id),
+            ground_truth_id INTEGER NOT NULL REFERENCES ground_truths(id),
+            original_text   TEXT NOT NULL,
+            confidence      REAL,
+            source          TEXT NOT NULL,
+            created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_corrections_sample ON corrections(sample_id);
+        UPDATE schema_version SET version = 5;
+    """,
+    # v6: Add is_baseline flag to runs (Phase 9 / RPT-01)
+    6: """
+        ALTER TABLE runs ADD COLUMN is_baseline INTEGER DEFAULT 0;
+        UPDATE schema_version SET version = 6;
     """,
 }
 
@@ -414,8 +445,38 @@ def list_runs(conn: sqlite3.Connection) -> list[RunSummary]:
             iam_partition=r["iam_partition"] if "iam_partition" in keys else None,
             norm_flags=r["norm_flags"] if "norm_flags" in keys else None,
             vocab_hints_off=r["vocab_hints_off"] if "vocab_hints_off" in keys else 0,
+            is_baseline=r["is_baseline"] if "is_baseline" in keys else 0,
         ))
     return results
+
+
+# --- Baseline pinning (Phase 9 / RPT-01) ---
+
+
+def set_baseline(conn: sqlite3.Connection, run_id: int) -> None:
+    """Pin a run as the regression-detection anchor.
+
+    Atomically clears the flag on every other run, then sets it on the
+    target. Multiple baselines is a footgun (which one does
+    detect_regressions compare against?), so we enforce at-most-one here
+    rather than via a partial-unique index.
+
+    Raises ValueError if the run does not exist.
+    """
+    row = conn.execute("SELECT 1 FROM runs WHERE id = ?", (run_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"run {run_id} not found")
+    conn.execute("UPDATE runs SET is_baseline = 0")
+    conn.execute("UPDATE runs SET is_baseline = 1 WHERE id = ?", (run_id,))
+    conn.commit()
+
+
+def get_baseline_run_id(conn: sqlite3.Connection) -> int | None:
+    """Return the pinned baseline run_id, or None if no run is pinned."""
+    row = conn.execute(
+        "SELECT id FROM runs WHERE is_baseline = 1 ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    return row["id"] if row else None
 
 
 # --- Provider Outputs ---
@@ -498,3 +559,59 @@ def get_latest_run_id(conn: sqlite3.Connection) -> int | None:
     """Get the most recent run ID."""
     row = conn.execute("SELECT id FROM runs ORDER BY id DESC LIMIT 1").fetchone()
     return row["id"] if row else None
+
+
+# --- Corrections (S4: instructor feedback loop) ---
+
+
+def record_correction(
+    conn: sqlite3.Connection,
+    *,
+    image_path: str,
+    writer_id: str,
+    corrected_text: str,
+    original_vlm_text: str,
+    confidence: float,
+    source: str = "labgrader",
+) -> int:
+    """Idempotently record an instructor-corrected transcription.
+
+    Behavior with identical args called twice:
+    - One sample row (deduped by image content hash).
+    - One ground_truth row (deduped by sample_id + text).
+    - Two corrections rows (history grows; each call records a confirmation).
+
+    Returns the corrections row id from this call.
+    """
+    from handwriting_engine.benchmark.ingest import hash_file
+
+    image_hash = hash_file(image_path)
+
+    sample = get_sample_by_hash(conn, image_hash)
+    if sample is None:
+        sample_id = insert_sample(
+            conn,
+            image_path=image_path,
+            image_hash=image_hash,
+            student=writer_id,
+        )
+    else:
+        sample_id = sample.id
+
+    gt_row = conn.execute(
+        "SELECT id FROM ground_truths WHERE sample_id = ? AND text = ? ORDER BY id DESC LIMIT 1",
+        (sample_id, corrected_text),
+    ).fetchone()
+    if gt_row is None:
+        gt_id = insert_ground_truth(conn, sample_id, corrected_text, source=source)
+    else:
+        gt_id = gt_row["id"]
+
+    cur = conn.execute(
+        """INSERT INTO corrections
+               (sample_id, ground_truth_id, original_text, confidence, source)
+           VALUES (?, ?, ?, ?, ?)""",
+        (sample_id, gt_id, original_vlm_text, confidence, source),
+    )
+    conn.commit()
+    return cur.lastrowid

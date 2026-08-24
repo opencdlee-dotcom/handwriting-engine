@@ -11,11 +11,31 @@ Does NOT correct proper nouns, numbers, or abbreviations.
 
 from __future__ import annotations
 
+import os
 import re
 import logging
+from dataclasses import dataclass
 from functools import lru_cache
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class Correction:
+    """A single confusion-pair correction applied during postprocessing."""
+    original: str
+    corrected: str
+    pair: str  # e.g. "I↔l" — the confusion-pair label that triggered the swap
+
+
+def _trained_corrector_enabled(explicit: bool | None) -> bool:
+    """Resolve whether the trained corrector should run.
+
+    Precedence: explicit kwarg > env var > default off.
+    """
+    if explicit is not None:
+        return explicit
+    return os.environ.get("HE_USE_TRAINED_CORRECTOR", "").lower() in ("1", "true", "yes", "on")
 
 # Biology domain word list — common lab terms that OCR confuses
 _BIOLOGY_TERMS = {
@@ -427,3 +447,209 @@ def correct_domain_terms(text: str, domain: str = "biology") -> str:
         logger.info("Domain correction (%s): %d word(s) corrected", domain, corrections_made)
 
     return " ".join(corrected)
+
+
+def _confusion_postprocess_enabled() -> bool:
+    """HE_CONFUSION_POSTPROCESS env flag — default ON; set 0 to disable."""
+    val = os.environ.get("HE_CONFUSION_POSTPROCESS")
+    if val is None:
+        return True
+    return val.strip().lower() not in ("0", "false", "no", "off")
+
+
+def correct_confusion_pairs(
+    text: str,
+    *,
+    domain: str = "biology",
+    writer_id: str | None = None,
+    db_path=None,
+) -> tuple[str, list[Correction]]:
+    """Confusion-pair-aware single-word swap.
+
+    For each word that is NOT in the domain wordlist, try swapping a single
+    confusion-pair occurrence (`I→l`, `rn→m`, `cl→d`, `0→O`, …). If exactly
+    one candidate produced by such a swap is in the wordlist, prefer the swap
+    and record a Correction.
+
+    Higher-precision than the existing edit-distance-1 pass: only swaps that
+    correspond to known confusion pairs are considered, and only when the
+    resulting word is unambiguously a domain term.
+
+    Args:
+        text: Transcription text to correct.
+        domain: One of 'biology', 'chemistry', 'general', 'science'.
+        writer_id: Optional writer ID. Reserved for per-writer biasing once
+            S4's corrections table is populated; today the engine falls back
+            to global confusion pairs and the value is ignored.
+        db_path: Optional path to benchmark DB. Reserved for the same reason.
+
+    Returns:
+        Tuple of (corrected_text, list_of_corrections).
+    """
+    from handwriting_engine.consensus import (
+        _CHAR_CONFUSION_PAIRS,
+        _confusion_pair_label,
+    )
+
+    wordlist = _DOMAIN_WORDLISTS.get(domain, _GENERAL_TERMS)
+    words = text.split()
+    corrections: list[Correction] = []
+    out: list[str] = []
+
+    for word in words:
+        # Strip leading / trailing non-alpha for lookup (mirrors correct_domain_terms)
+        stripped = word.rstrip(".,;:!?")
+        suffix = word[len(stripped):]
+        prefix = ""
+        i = 0
+        while i < len(stripped) and not stripped[i].isalpha() and not stripped[i].isdigit():
+            prefix += stripped[i]
+            i += 1
+        core_raw = stripped[i:]
+        j = len(core_raw)
+        while j > 0 and not core_raw[j - 1].isalpha() and not core_raw[j - 1].isdigit():
+            j -= 1
+        core = core_raw[:j]
+        suffix = core_raw[j:] + suffix
+
+        if len(core) < 3 or _SKIP_RE.match(core):
+            out.append(word)
+            continue
+
+        if core.lower() in wordlist:
+            out.append(word)
+            continue
+
+        # Generate 1-confusion-pair-swap candidates.
+        candidates: list[tuple[str, str]] = []  # (candidate_core, pair_label)
+        seen: set[str] = {core}
+        for alt, canon in _CHAR_CONFUSION_PAIRS:
+            label = _confusion_pair_label(alt, canon)
+            for src, dst in ((alt, canon), (canon, alt)):
+                idx = core.find(src)
+                while idx != -1:
+                    cand = core[:idx] + dst + core[idx + len(src):]
+                    if cand not in seen and cand.lower() in wordlist:
+                        candidates.append((cand, label))
+                        seen.add(cand)
+                    idx = core.find(src, idx + 1)
+
+        if len(candidates) != 1:
+            out.append(word)
+            continue
+
+        new_core, label = candidates[0]
+        # Preserve capitalization where possible — if the original core was
+        # capitalized at position 0, capitalize the swap result too.
+        if core[:1].isupper() and not new_core[:1].isupper():
+            new_core = new_core[:1].upper() + new_core[1:]
+        new_word = prefix + new_core + suffix
+        corrections.append(Correction(original=word, corrected=new_word, pair=label))
+        logger.info(
+            "Confusion-pair correction: '%s' -> '%s' (pair %s)",
+            word, new_word, label,
+        )
+        out.append(new_word)
+
+    return " ".join(out), corrections
+
+
+def correct(
+    text: str,
+    domain: str = "biology",
+    use_trained: bool | None = None,
+    fidelity_threshold: float = 0.35,
+    require_heuristic_hit: bool = True,
+) -> str:
+    """Full post-correction orchestrator: heuristic pass first, optional trained pass second.
+
+    Order matters. The heuristic pass is high-precision (only fires when
+    unambiguous) and runs cheap; running it first means the trained model
+    sees mostly-clean text and only has to fix the contextual / multi-char
+    errors the heuristic can't. Reversed order tends to let the trained model
+    introduce errors the heuristic then can't undo because they look like
+    valid words.
+
+    Two safeguards mitigate the synthetic-to-real hallucination failure mode:
+
+    1. **Confidence gate** (`require_heuristic_hit=True`): only run the trained
+       model when the heuristic actually made a correction. Rationale: if the
+       heuristic found errors, there are likely more of them; if it didn't,
+       either the input is clean (trained pass risks rewriting it) or the
+       errors are out-of-vocabulary (trained pass tends to hallucinate
+       plausible-sounding wrong words). Flip to False to always run trained.
+
+    2. **Fidelity check** (`fidelity_threshold`): if the trained pass changes
+       too much of the text (Levenshtein-distance ratio > threshold), reject
+       its output and keep the heuristic result. Threshold is a fraction of
+       max(len_in, len_out). Default 0.35 catches the canonical hallucination
+       pattern (`niitochondria → nucleotide` is ~62% changed) while permitting
+       legitimate corrections (`mitocondria → mitochondria` is ~8%).
+
+    `use_trained` precedence: explicit > env var HE_USE_TRAINED_CORRECTOR > off.
+    Returns input unchanged on the trained pass if no checkpoint is found.
+    """
+    heuristic_out = correct_domain_terms(text, domain)
+
+    # S5 confusion-pair-aware pass — runs after edit-distance-1 wordlist
+    # correction. Default ON; HE_CONFUSION_POSTPROCESS=0 disables for A/B.
+    if _confusion_postprocess_enabled():
+        heuristic_out, _ = correct_confusion_pairs(heuristic_out, domain=domain)
+
+    heuristic_made_changes = heuristic_out != text
+
+    if not _trained_corrector_enabled(use_trained):
+        return heuristic_out
+
+    if require_heuristic_hit and not heuristic_made_changes:
+        # Confidence gate: heuristic didn't fire, so the trained model is at
+        # higher risk of hallucinating. Skip and return clean input.
+        logger.debug("Confidence gate: heuristic made no changes; skipping trained pass")
+        return heuristic_out
+
+    try:
+        from handwriting_engine.trained_correction.corrector import correct as trained_correct, is_available
+        if not is_available():
+            logger.debug("Trained corrector requested but no checkpoint found")
+            return heuristic_out
+        trained_out = trained_correct(heuristic_out)
+    except ImportError:
+        logger.warning("Trained corrector requested but optional deps missing; skipping")
+        return heuristic_out
+
+    # Fidelity check: reject pathological rewrites
+    if not _within_fidelity(heuristic_out, trained_out, fidelity_threshold):
+        logger.info(
+            "Fidelity check: trained output diverges too far from heuristic output; "
+            "falling back. ratio=%.2f threshold=%.2f",
+            _change_ratio(heuristic_out, trained_out),
+            fidelity_threshold,
+        )
+        return heuristic_out
+    return trained_out
+
+
+def _change_ratio(a: str, b: str) -> float:
+    """Levenshtein distance / max(len_a, len_b). 0.0 = identical, 1.0 = totally different."""
+    if not a and not b:
+        return 0.0
+    if a == b:
+        return 0.0
+    # Inline Levenshtein (avoid pulling jiwer / other deps for one call site)
+    if not a:
+        return 1.0
+    if not b:
+        return 1.0
+    prev = list(range(len(b) + 1))
+    cur = [0] * (len(b) + 1)
+    for i, ca in enumerate(a, 1):
+        cur[0] = i
+        for j, cb in enumerate(b, 1):
+            cur[j] = min(cur[j - 1] + 1, prev[j] + 1, prev[j - 1] + (0 if ca == cb else 1))
+        prev, cur = cur, prev
+    return prev[len(b)] / max(len(a), len(b))
+
+
+def _within_fidelity(reference: str, candidate: str, threshold: float) -> bool:
+    """True if the candidate is similar enough to the reference to be trusted."""
+    return _change_ratio(reference, candidate) <= threshold

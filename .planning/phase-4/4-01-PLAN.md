@@ -13,7 +13,7 @@
     <task type="auto">
       <name>Add sauvola_enhance() to enhance.py</name>
       <action>
-In ~/Developer/handwriting-engine/handwriting_engine/enhance.py:
+In /Users/user/Documents/VSCode Projects/handwriting-engine/handwriting_engine/enhance.py:
 
 1. Add sauvola_enhance() function after clahe_enhance():
 
@@ -73,7 +73,7 @@ def sauvola_enhance(
     <task type="auto">
       <name>Add test_sauvola to tests/test_enhance.py</name>
       <action>
-In ~/Developer/handwriting-engine/tests/test_enhance.py, append:
+In /Users/user/Documents/VSCode Projects/handwriting-engine/tests/test_enhance.py, append:
 
 def test_sauvola_enhance_returns_path(tmp_path):
     """sauvola_enhance should return a path without crashing."""
@@ -101,7 +101,7 @@ Make sure the test file imports Image from PIL at the top if not already there.
     <task type="auto">
       <name>Create writer_profile_store.py</name>
       <action>
-Create ~/Developer/handwriting-engine/handwriting_engine/writer_profile_store.py:
+Create /Users/user/Documents/VSCode Projects/handwriting-engine/handwriting_engine/writer_profile_store.py:
 
 """
 Persistent writer profile store for cross-session handwriting calibration.
@@ -218,7 +218,7 @@ class WriterProfileStore:
     <task type="auto">
       <name>Create tests/test_writer_profile_store.py and commit</name>
       <action>
-Create ~/Developer/handwriting-engine/tests/test_writer_profile_store.py:
+Create /Users/user/Documents/VSCode Projects/handwriting-engine/tests/test_writer_profile_store.py:
 
 """Tests for WriterProfileStore."""
 import pytest
