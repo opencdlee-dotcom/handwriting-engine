@@ -54,7 +54,12 @@ jobs:
         with:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
-      - run: uv sync --locked --all-extras
+      # Named extras, not --all-extras: `feat/trained-corrector` adds a
+      # trained-correction extra whose torch + CUDA wheels are gigabytes per run,
+      # and every test that touches them is written to run with the backend absent
+      # (mocked model, or gated behind TRAINED_CORRECTOR_CKPT). Naming the extras
+      # keeps this one workflow honest on both branches.
+      - run: uv sync --locked --extra all --extra benchmark --extra dev
       # No API keys are configured on purpose: a test that needs a live provider must
       # skip or mock, and one that silently passes because a key is absent is worse than
       # one that fails.
