@@ -1,0 +1,61 @@
+# The suite runs on a machine that is not this laptop, from the manifest alone.
+#
+# Added 2026-08-24, after the repo spent months with 25 open Dependabot alerts and no way
+# to act on any of them: nothing here had ever run the tests from a clean install, the
+# only .venv on disk pointed at a directory that no longer existed, and two module-scope
+# imports (cv2, numpy) were absent from the manifest -- so the suite could not even be
+# COLLECTED in a fresh environment. A dependency bump you cannot test is a bump nobody
+# dares to make, which is why the alerts sat. This workflow is the thing that makes them
+# actionable: every push, every PR, and once a week even when nothing is pushed, because
+# a dependency can break a repo that has not changed.
+name: tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Does the DECLARED dependency set actually build a working package? This is the job
+  # that would have failed the day cv2 went undeclared: it installs the locked core
+  # dependencies and nothing else, then imports every module.
+  core-install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: true
+      # --locked: the lockfile must already agree with pyproject.toml. A PR that edits
+      # dependencies without re-locking fails here instead of resolving something
+      # different from what every other machine installs.
+      - run: uv sync --locked
+      - run: uv run --locked --with pytest pytest -q tests/test_package_imports.py
+
+  suite:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+      - run: uv sync --locked --all-extras
+      # No API keys are configured on purpose: a test that needs a live provider must
+      # skip or mock, and one that silently passes because a key is absent is worse than
+      # one that fails.
+      - run: uv run --locked pytest -q

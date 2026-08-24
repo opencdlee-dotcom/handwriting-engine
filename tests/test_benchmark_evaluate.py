@@ -470,6 +470,17 @@ class TestCompareRuns:
 class TestSweep:
     """RED stubs for sweep infrastructure (IAM-02). All must FAIL until Wave 2."""
 
+    # These are TODO stubs, not tests: each body is a bare pytest.fail() naming work that
+    # was never done. Left as hard failures they made the suite permanently red, and a
+    # suite that is always red cannot gate a dependency upgrade -- which is how 25
+    # security advisories sat unactioned. Declared as expected failures they still print
+    # their message on every run (counted as "xfailed"), so the debt stays visible while
+    # a NEW failure is once again the only reason the suite goes red. Deleting the marker
+    # is part of implementing sweep infrastructure (IAM-02).
+    pytestmark = pytest.mark.xfail(
+        reason="RED stub: sweep infrastructure (IAM-02) is unimplemented", strict=False
+    )
+
     def test_run_benchmark_accepts_line_level(self, seeded_db):
         pytest.fail(
             "not implemented — run_benchmark must accept line_level=True "
@@ -503,6 +514,17 @@ class TestSweep:
 
 class TestPerWriterReport:
     """RED stubs for per-writer report (IAM-03). All must FAIL until Wave 2."""
+
+    # These are TODO stubs, not tests: each body is a bare pytest.fail() naming work that
+    # was never done. Left as hard failures they made the suite permanently red, and a
+    # suite that is always red cannot gate a dependency upgrade -- which is how 25
+    # security advisories sat unactioned. Declared as expected failures they still print
+    # their message on every run (counted as "xfailed"), so the debt stays visible while
+    # a NEW failure is once again the only reason the suite goes red. Deleting the marker
+    # is part of implementing the per-writer report (IAM-03).
+    pytestmark = pytest.mark.xfail(
+        reason="RED stub: the per-writer report (IAM-03) is unimplemented", strict=False
+    )
 
     def test_per_writer_report_groups_by_student(self, seeded_db):
         pytest.fail(

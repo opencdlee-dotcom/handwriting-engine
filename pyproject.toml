@@ -12,6 +12,11 @@ dependencies = [
     "PyMuPDF>=1.24.0",
     "click>=8.1.0",
     "python-dotenv>=1.0.0",
+    # line_reader imports cv2 and numpy at module scope, unguarded -- so they are core,
+    # not optional. Headless because nothing here opens a window (no imshow/waitKey),
+    # and the GUI build drags in system libs a CI runner does not have.
+    "numpy>=1.24.0",
+    "opencv-python-headless>=4.9.0",
 ]
 
 [project.optional-dependencies]
